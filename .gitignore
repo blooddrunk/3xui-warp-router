@@ -1,0 +1,12 @@
+# Local state / secrets
+.env
+.env.*
+*.backup
+*.bak
+backups/
+state/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
