@@ -1,0 +1,41 @@
+name: Bootstrap script
+
+on:
+  push:
+    paths:
+      - '.bootstrap/**'
+      - '.github/workflows/bootstrap-script.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Assemble and verify script
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .bootstrap/part*.b64 | tr -d '\r\n' | base64 --decode > 3xui-warp-router.sh
+          chmod +x 3xui-warp-router.sh
+          echo '58d7203c1078dc0f59a53be6d1b96154a90e6f1e855234c9abd1f9cc01c17e46  3xui-warp-router.sh' | sha256sum --check --strict
+          bash -n 3xui-warp-router.sh
+
+      - name: Commit verified script
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add 3xui-warp-router.sh
+          if git diff --cached --quiet; then
+            echo 'Script already matches expected content.'
+            exit 0
+          fi
+          git commit -m 'feat: add 3xui WARP router'
+          git push
