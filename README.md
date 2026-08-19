@@ -107,14 +107,23 @@ cd 3xui-warp-router
 chmod +x 3xui-warp-router.sh
 ```
 
-## 3. 设置面板 API 地址
+## 3. 配置 3x-ui API（推荐一次性持久保存）
 
-普通安装：
+推荐先运行：
 
 ```bash
-export XUI_API_BASE='https://panel.example.com:2053/panel/api'
-export XUI_API_TOKEN='YOUR_API_TOKEN'
+3xui-warp-router configure \
+  --api-base 'https://panel.example.com:2053/panel/api'
 ```
+
+脚本会无回显询问 API Token，先验证能否登录 3x-ui，然后保存：
+
+```text
+~/.config/3xui-warp-router/config
+~/.config/3xui-warp-router/token
+```
+
+两个文件都会使用 `0600` 权限；Token 不会写入普通配置文件。以后重新 SSH、开新 shell、甚至服务器重启后，`status` / `test` / `rotate` 等命令都不需要重新 `export`。
 
 如果你的 3x-ui 配置了 Web Base Path，例如：
 
@@ -122,14 +131,33 @@ export XUI_API_TOKEN='YOUR_API_TOKEN'
 https://panel.example.com:2053/secret/
 ```
 
-则使用：
+则：
 
 ```bash
-export XUI_API_BASE='https://panel.example.com:2053/secret/panel/api'
+3xui-warp-router configure \
+  --api-base 'https://panel.example.com:2053/secret/panel/api'
+```
+
+### 临时环境变量方式
+
+如果你不希望把 Token 保存到磁盘，也可以继续使用：
+
+```bash
+export XUI_API_BASE='https://panel.example.com:2053/panel/api'
 export XUI_API_TOKEN='YOUR_API_TOKEN'
 ```
 
-> 不建议把 API Token 直接写进 shell history。交互式终端中如果不设置 `XUI_API_TOKEN`，脚本会无回显地询问 Token。
+这种 `export` 只对当前 shell 有效；它消失不会影响已经写入 3x-ui 的 WARP outbound 和 routing rules，只会影响你以后再次调用管理脚本。
+
+也可以只保存 Token 到自己指定的权限受控文件：
+
+```bash
+3xui-warp-router status \
+  --api-base 'https://panel.example.com:2053/panel/api' \
+  --token-file /root/.secrets/3xui-api-token
+```
+
+> 不建议把真实 API Token 写进 shell history、README、issue 或公开日志。
 
 ## 4. 推荐的首次运行
 
@@ -161,6 +189,37 @@ export XUI_API_TOKEN='YOUR_API_TOKEN'
 8. 测试 Google / YouTube 的实际路由选择。
 9. 测试 WARP outbound 是否真正可用。
 10. 如果验证失败，默认恢复到修改前的配置。
+
+## 重启后会发生什么？
+
+`3xui-warp-router` **不是常驻 daemon**，也不需要开机再次执行。它只是通过 3x-ui API 写入 Xray/WARP 配置。
+
+首次 `install` 成功后：
+
+```text
+服务器重启
+   ↓
+3x-ui / Xray 启动
+   ↓
+读取已经保存的 warp outbound + routing rules
+   ↓
+Google / Gemini 继续按原规则走 WARP
+```
+
+所以：
+
+- 不需要 systemd 定时重跑本脚本；
+- `export XUI_API_BASE/XUI_API_TOKEN` 是否还存在，不影响已经生效的路由；
+- 如果使用了 `configure`，重启后连管理命令也不需要再次 export。
+
+可以随时验证：
+
+```bash
+3xui-warp-router status
+3xui-warp-router test
+```
+
+从 v0.2.0 开始，`test` 和 `rotate` 会读取**当前实际安装的 managed rules** 来决定测试 Google / Gemini / YouTube 的哪条路由，而不是假设你仍然使用默认的 `google-web + youtube direct`。这避免了重启后或更换 profile 后的误报。
 
 ## Profile
 
@@ -274,6 +333,14 @@ geosite:google
 
 ### 设置 3x-ui 原生自动换 IP
 
+3x-ui 自带 WARP 自动轮换能力，但**默认关闭**（interval = `0`）。本脚本不会在你没有显式要求时自动开启它。
+
+推荐先查看当前状态：
+
+```bash
+3xui-warp-router rotation
+```
+
 例如每 7 天：
 
 ```bash
@@ -286,8 +353,16 @@ geosite:google
 关闭：
 
 ```bash
-3xui-warp-router apply --rotate-days 0
+3xui-warp-router rotation --rotate-days 0
 ```
+
+也可以不改 routing，单独设置：
+
+```bash
+3xui-warp-router rotation --rotate-days 7
+```
+
+`status` 现在也会显示当前 3x-ui WARP 自动轮换间隔。
 
 > 不建议为了“看起来更随机”而高频换 IP。对于 Google 地区判定问题，找到一个稳定可用的出口后保持稳定通常更合理。
 
@@ -322,6 +397,9 @@ geosite:google
 | 参数 | 含义 |
 |---|---|
 | `--api-base URL` | 3x-ui API base，通常以 `/panel/api` 结尾 |
+| `--token-file FILE` | 从权限受控文件读取 API Token |
+| `--config FILE` | 指定持久配置文件 |
+| `--no-config` | 本次运行忽略持久配置文件 |
 | `--profile NAME` | `google-web` / `gemini` / `google-all` / `custom` |
 | `--youtube MODE` | `direct` 或 `warp` |
 | `--custom-file FILE` | 自定义 Xray domain token 文件 |
@@ -337,6 +415,8 @@ geosite:google
 ```text
 XUI_API_BASE
 XUI_API_TOKEN
+XUI_API_TOKEN_FILE
+XUI_WARP_CONFIG_FILE
 XUI_WARP_PROFILE
 XUI_YOUTUBE_MODE
 XUI_WARP_PRIORITY
