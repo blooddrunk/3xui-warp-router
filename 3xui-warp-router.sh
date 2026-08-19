@@ -2,21 +2,27 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 SCRIPT_NAME="${0##*/}"
 
 API_BASE="${XUI_API_BASE:-}"
 API_TOKEN="${XUI_API_TOKEN:-}"
-PROFILE="${XUI_WARP_PROFILE:-google-web}"
-YOUTUBE_MODE="${XUI_YOUTUBE_MODE:-direct}"
-PRIORITY="${XUI_WARP_PRIORITY:-prepend}"
+TOKEN_FILE="${XUI_API_TOKEN_FILE:-}"
+PROFILE="${XUI_WARP_PROFILE:-}"
+YOUTUBE_MODE="${XUI_YOUTUBE_MODE:-}"
+PRIORITY="${XUI_WARP_PRIORITY:-}"
 DIRECT_TAG_OVERRIDE="${XUI_DIRECT_TAG:-}"
 CUSTOM_FILE=""
-STATE_DIR="${XUI_WARP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/3xui-warp-router}"
-INSECURE=0
+STATE_DIR="${XUI_WARP_STATE_DIR:-}"
+INSECURE="${XUI_WARP_INSECURE:-}"
 AUTO_ROLLBACK=1
 ROTATE_DAYS=""
 COMMAND=""
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+DEFAULT_CONFIG_DIR="${CONFIG_HOME%/}/3xui-warp-router"
+CONFIG_FILE="${XUI_WARP_CONFIG_FILE:-$DEFAULT_CONFIG_DIR/config}"
+CONFIG_DISABLED=0
 
 MARKER_WARP="full:xui-warp-router-warp.invalid"
 MARKER_DIRECT="full:xui-warp-router-direct.invalid"
@@ -64,22 +70,28 @@ Usage:
   3xui-warp-router.sh <command> [options]
 
 Commands:
+  configure     Save API base + token file securely for future invocations
   install       Ensure native 3x-ui WARP outbound exists, then apply routing
   bootstrap     Ensure native 3x-ui WARP account/outbound exists, no route changes
   apply         Apply/update managed routing rules; requires a warp outbound
-  status        Show WARP outbound and managed routing state
-  test          Test WARP outbound connectivity and routing decisions
-  rotate        Ask 3x-ui to rotate WARP IP, then test it
+  status        Show WARP outbound, routing, and auto-rotation state
+  test          Test the currently installed managed rules and WARP connectivity
+  rotate        Ask 3x-ui to rotate WARP IP, then test current installed rules
+  rotation      Show or set 3x-ui WARP auto-rotation without changing routing
   remove        Remove only routing rules managed by this script
   rollback      Restore the latest local Xray-config backup
   backups       List local backups
 
-Required connection settings:
+Connection settings (precedence: CLI > environment > config file > prompt):
   --api-base URL      Base URL ending in /panel/api
                       Example: https://panel.example.com:2053/panel/api
                       With web base path: https://host:2053/secret/panel/api
                       Env: XUI_API_BASE
-  API token           Env XUI_API_TOKEN (preferred). If omitted on a TTY,
+  --token-file FILE   Read API token from a mode-0600 file
+                      Env: XUI_API_TOKEN_FILE
+  --config FILE       Config file (default: ~/.config/3xui-warp-router/config)
+  --no-config         Do not load the default/configured config file
+  API token           Env XUI_API_TOKEN. If still unavailable on a TTY,
                       the script prompts without echoing it.
 
 Routing options:
@@ -90,7 +102,7 @@ Routing options:
                       geosite:google. Blank lines and # comments are ignored.
   --priority MODE     prepend (default) or append relative to existing user rules
   --direct-tag TAG    Explicit freedom outbound tag. Otherwise auto-detected.
-  --rotate-days N     On install, set 3x-ui WARP auto-rotation interval (0 disables)
+  --rotate-days N     Set 3x-ui WARP auto-rotation interval in days (0 disables)
 
 Safety options:
   --insecure          Disable TLS certificate verification for the panel API
@@ -99,12 +111,17 @@ Safety options:
   -h, --help          Show this help
 
 Examples:
+  # Recommended one-time persistent setup. The token is stored in a 0600 file.
+  ./3xui-warp-router.sh configure --api-base 'https://panel.example.com:2053/panel/api'
+  ./3xui-warp-router.sh install --profile google-web --youtube direct
+
+  # Or use temporary shell environment variables instead.
   export XUI_API_BASE='https://panel.example.com:2053/panel/api'
   export XUI_API_TOKEN='...token from Settings -> Security -> API Token...'
 
-  ./3xui-warp-router.sh install --profile google-web --youtube direct
   ./3xui-warp-router.sh test
   ./3xui-warp-router.sh rotate
+  ./3xui-warp-router.sh rotation --rotate-days 7
   ./3xui-warp-router.sh remove
   ./3xui-warp-router.sh rollback
 
@@ -121,6 +138,77 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
 }
 
+trim_space() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+preparse_config_args() {
+  local args=("$@") i=1
+  while (( i < ${#args[@]} )); do
+    case "${args[$i]}" in
+      --config)
+        (( i + 1 < ${#args[@]} )) || die "--config requires a value"
+        CONFIG_FILE="${args[$((i + 1))]}"
+        i=$((i + 2))
+        ;;
+      --no-config)
+        CONFIG_DISABLED=1
+        i=$((i + 1))
+        ;;
+      *)
+        i=$((i + 1))
+        ;;
+    esac
+  done
+}
+
+load_config_file() {
+  (( CONFIG_DISABLED )) && return 0
+  [[ -f "$CONFIG_FILE" ]] || return 0
+
+  local raw key value
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    raw="${raw%$'\r'}"
+    [[ "$raw" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$raw" =~ ^[[:space:]]*# ]] && continue
+    [[ "$raw" == *=* ]] || { warn "Ignoring malformed config line in $CONFIG_FILE"; continue; }
+    key="$(trim_space "${raw%%=*}")"
+    value="$(trim_space "${raw#*=}")"
+    case "$key" in
+      api_base)   [[ -n "$API_BASE" ]] || API_BASE="$value" ;;
+      token_file) [[ -n "$TOKEN_FILE" ]] || TOKEN_FILE="$value" ;;
+      profile)    [[ -n "$PROFILE" ]] || PROFILE="$value" ;;
+      youtube)    [[ -n "$YOUTUBE_MODE" ]] || YOUTUBE_MODE="$value" ;;
+      priority)   [[ -n "$PRIORITY" ]] || PRIORITY="$value" ;;
+      direct_tag) [[ -n "$DIRECT_TAG_OVERRIDE" ]] || DIRECT_TAG_OVERRIDE="$value" ;;
+      state_dir)  [[ -n "$STATE_DIR" ]] || STATE_DIR="$value" ;;
+      insecure)   [[ -n "$INSECURE" ]] || INSECURE="$value" ;;
+      *) warn "Ignoring unknown config key '$key' in $CONFIG_FILE" ;;
+    esac
+  done <"$CONFIG_FILE"
+}
+
+finalize_defaults() {
+  [[ -n "$PROFILE" ]] || PROFILE="google-web"
+  [[ -n "$YOUTUBE_MODE" ]] || YOUTUBE_MODE="direct"
+  [[ -n "$PRIORITY" ]] || PRIORITY="prepend"
+  [[ -n "$STATE_DIR" ]] || STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/3xui-warp-router"
+  case "${INSECURE,,}" in
+    1|true|yes|on) INSECURE=1 ;;
+    ''|0|false|no|off) INSECURE=0 ;;
+    *) die "Invalid insecure value in environment/config: $INSECURE" ;;
+  esac
+}
+
+validate_options() {
+  case "$PROFILE" in google-web|gemini|google-all|custom) ;; *) die "Invalid --profile: $PROFILE" ;; esac
+  case "$YOUTUBE_MODE" in direct|warp) ;; *) die "Invalid --youtube: $YOUTUBE_MODE" ;; esac
+  case "$PRIORITY" in prepend|append) ;; *) die "Invalid --priority: $PRIORITY" ;; esac
+}
+
 normalize_api_base() {
   API_BASE="${API_BASE%/}"
   [[ -n "$API_BASE" ]] || {
@@ -135,11 +223,24 @@ normalize_api_base() {
 }
 
 ensure_token() {
+  if [[ -z "$API_TOKEN" && -n "$TOKEN_FILE" ]]; then
+    [[ -f "$TOKEN_FILE" ]] || die "API token file not found: $TOKEN_FILE"
+    [[ -r "$TOKEN_FILE" ]] || die "API token file is not readable: $TOKEN_FILE"
+    if [[ -L "$TOKEN_FILE" ]]; then
+      warn "API token file is a symlink: $TOKEN_FILE"
+    fi
+    local mode
+    mode="$(stat -c '%a' "$TOKEN_FILE" 2>/dev/null || true)"
+    if [[ "$mode" =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 077) != 0 )); then
+      warn "API token file permissions are broader than recommended (0600): $TOKEN_FILE mode=$mode"
+    fi
+    IFS= read -r API_TOKEN <"$TOKEN_FILE" || true
+  fi
   if [[ -z "$API_TOKEN" && -t 0 ]]; then
     read -r -s -p "3x-ui API token: " API_TOKEN
     printf '\n' >&2
   fi
-  [[ -n "$API_TOKEN" ]] || die "Set XUI_API_TOKEN. Use a 3x-ui API Token, not your panel password."
+  [[ -n "$API_TOKEN" ]] || die "Set XUI_API_TOKEN, configure a token_file, or use --token-file. Use a 3x-ui API Token, not your panel password."
 }
 
 init_curl() {
@@ -147,6 +248,52 @@ init_curl() {
     CURL_COMMON+=(--insecure)
   fi
   CURL_COMMON+=(-H "Authorization: Bearer ${API_TOKEN}")
+}
+
+write_persistent_config() {
+  local config_dir token_dest token_dir config_tmp token_tmp
+  config_dir="$(dirname "$CONFIG_FILE")"
+  token_dest="${TOKEN_FILE:-$config_dir/token}"
+  token_dir="$(dirname "$token_dest")"
+
+  mkdir -p "$config_dir" "$token_dir"
+  chmod 700 "$config_dir" 2>/dev/null || true
+  [[ ! -L "$CONFIG_FILE" ]] || die "Refusing to replace symlink config file: $CONFIG_FILE"
+  [[ ! -L "$token_dest" ]] || die "Refusing to write API token through symlink: $token_dest"
+
+  config_tmp="$(mktemp "$config_dir/.config.XXXXXX")"
+  token_tmp="$(mktemp "$token_dir/.token.XXXXXX")"
+  chmod 600 "$config_tmp" "$token_tmp" 2>/dev/null || true
+  {
+    printf 'api_base=%s\n' "$API_BASE"
+    printf 'token_file=%s\n' "$token_dest"
+    printf 'profile=%s\n' "$PROFILE"
+    printf 'youtube=%s\n' "$YOUTUBE_MODE"
+    printf 'priority=%s\n' "$PRIORITY"
+    [[ -z "$DIRECT_TAG_OVERRIDE" ]] || printf 'direct_tag=%s\n' "$DIRECT_TAG_OVERRIDE"
+    printf 'state_dir=%s\n' "$STATE_DIR"
+    printf 'insecure=%s\n' "$INSECURE"
+  } >"$config_tmp"
+  printf '%s\n' "$API_TOKEN" >"$token_tmp"
+
+  mv "$token_tmp" "$token_dest"
+  mv "$config_tmp" "$CONFIG_FILE"
+  chmod 600 "$token_dest" "$CONFIG_FILE" 2>/dev/null || true
+  TOKEN_FILE="$token_dest"
+
+  log "Saved persistent config: $CONFIG_FILE"
+  log "Saved API token file: $TOKEN_FILE (mode 0600)"
+}
+
+configure_connection() {
+  normalize_api_base
+  ensure_token
+  init_curl
+  if ! fetch_xray_payload >/dev/null; then
+    die "Cannot authenticate to 3x-ui with the supplied API base/token; nothing was saved"
+  fi
+  write_persistent_config
+  log "Configuration verified. Future commands can run without export after reboot."
 }
 
 api_post() {
@@ -792,21 +939,49 @@ show_status() {
     | select(((.domain // []) | index($mw)) != null or ((.domain // []) | index($md)) != null)
     | "- " + .outboundTag + ": " + ((.domain // []) | join(", "))
   ' "$cfg_file"
+  printf '\n3x-ui WARP rotation:\n'
+  show_rotate_interval
   rm -f "$cfg_file"
 }
 
 test_current() {
-  local payload cfg_file direct_tag
+  local payload cfg_file direct_tag warp_domains direct_domains ok=0 representative=""
   payload="$(fetch_xray_payload)" || die "Cannot read Xray settings"
   cfg_file="$(new_tmp)"
   jq '.xraySetting | if type == "string" then fromjson else . end' <<<"$payload" >"$cfg_file"
   has_warp_outbound "$cfg_file" || die "WARP outbound missing"
   direct_tag="$(find_direct_tag "$cfg_file")"
-  post_apply_test "$cfg_file" "$direct_tag" || {
-    rm -f "$cfg_file"
-    die "One or more tests failed"
-  }
+
+  warp_domains="$(jq -c --arg m "$MARKER_WARP" '[.routing.rules[]? | select(((.domain // []) | index($m)) != null) | .domain[]? | select(. != $m)]' "$cfg_file")"
+  direct_domains="$(jq -c --arg m "$MARKER_DIRECT" '[.routing.rules[]? | select(((.domain // []) | index($m)) != null) | .domain[]? | select(. != $m)]' "$cfg_file")"
+
+  if jq -e 'any(.[]; . == "geosite:google" or . == "domain:google.com" or . == "full:www.google.com")' >/dev/null <<<"$warp_domains"; then
+    route_test 'www.google.com' 'warp' || ok=1
+  elif jq -e 'any(.[]; . == "domain:gemini.google.com" or . == "full:gemini.google.com")' >/dev/null <<<"$warp_domains"; then
+    route_test 'gemini.google.com' 'warp' || ok=1
+  else
+    representative="$(jq -r '[.[] | select(startswith("full:") or startswith("domain:")) | select(test("youtube|youtu\\.be|googlevideo|ytimg|yt\\.be") | not)][0] // empty' <<<"$warp_domains")"
+    if [[ -n "$representative" ]]; then
+      representative="${representative#full:}"
+      representative="${representative#domain:}"
+      route_test "$representative" 'warp' || ok=1
+    elif [[ "$(jq 'length' <<<"$warp_domains")" -gt 0 ]]; then
+      log "No deterministic representative domain for the managed WARP rule; skipping strict domain route assertion"
+    else
+      warn "No managed WARP routing rule found"
+      ok=1
+    fi
+  fi
+
+  if jq -e 'any(.[]; . == "geosite:youtube" or test("youtube|youtu\\.be|googlevideo|ytimg|yt\\.be"))' >/dev/null <<<"$direct_domains"; then
+    route_test 'www.youtube.com' "$direct_tag" || ok=1
+  elif jq -e 'any(.[]; . == "geosite:youtube" or test("youtube|youtu\\.be|googlevideo|ytimg|yt\\.be"))' >/dev/null <<<"$warp_domains"; then
+    route_test 'www.youtube.com' 'warp' || ok=1
+  fi
+
+  outbound_test "$cfg_file" || ok=1
   rm -f "$cfg_file"
+  (( ok == 0 )) || die "One or more tests failed"
   log "Tests passed"
 }
 
@@ -821,11 +996,41 @@ rotate_warp() {
   test_current
 }
 
+get_rotate_interval() {
+  local settings
+  settings="$(api_post_obj_json "/setting/all" 2>/dev/null)" || return 1
+  jq -r '.warpUpdateInterval // 0' <<<"$settings"
+}
+
+show_rotate_interval() {
+  local days
+  if days="$(get_rotate_interval)"; then
+    if [[ "$days" =~ ^[0-9]+$ ]] && (( days > 0 )); then
+      printf 'warp_auto_rotation_days=%s\n' "$days"
+    else
+      printf 'warp_auto_rotation_days=0 (disabled)\n'
+    fi
+  else
+    printf 'warp_auto_rotation_days=unknown\n'
+  fi
+}
+
 set_rotate_interval() {
   local days="$1"
   [[ "$days" =~ ^[0-9]+$ ]] || die "--rotate-days must be a non-negative integer"
   api_post_obj_json "/xray/warp/interval" "interval=$days" >/dev/null || die "Failed to set WARP rotation interval"
-  log "WARP auto-rotation interval set to ${days} day(s)"
+  if (( days == 0 )); then
+    log "WARP auto-rotation disabled"
+  else
+    log "WARP auto-rotation interval set to ${days} day(s)"
+  fi
+}
+
+manage_rotation() {
+  if [[ -n "$ROTATE_DAYS" ]]; then
+    set_rotate_interval "$ROTATE_DAYS"
+  fi
+  show_rotate_interval
 }
 
 list_backups() {
@@ -840,6 +1045,9 @@ parse_args() {
   while (($#)); do
     case "$1" in
       --api-base) [[ $# -ge 2 ]] || die "--api-base requires a value"; API_BASE="$2"; shift 2 ;;
+      --token-file) [[ $# -ge 2 ]] || die "--token-file requires a value"; TOKEN_FILE="$2"; shift 2 ;;
+      --config) [[ $# -ge 2 ]] || die "--config requires a value"; CONFIG_FILE="$2"; shift 2 ;;
+      --no-config) CONFIG_DISABLED=1; shift ;;
       --profile) [[ $# -ge 2 ]] || die "--profile requires a value"; PROFILE="$2"; shift 2 ;;
       --youtube) [[ $# -ge 2 ]] || die "--youtube requires a value"; YOUTUBE_MODE="$2"; shift 2 ;;
       --custom-file) [[ $# -ge 2 ]] || die "--custom-file requires a value"; CUSTOM_FILE="$2"; shift 2 ;;
@@ -855,15 +1063,31 @@ parse_args() {
     esac
   done
 
-  case "$PROFILE" in google-web|gemini|google-all|custom) ;; *) die "Invalid --profile: $PROFILE" ;; esac
-  case "$YOUTUBE_MODE" in direct|warp) ;; *) die "Invalid --youtube: $YOUTUBE_MODE" ;; esac
-  case "$PRIORITY" in prepend|append) ;; *) die "Invalid --priority: $PRIORITY" ;; esac
 }
 
 main() {
+  (($# > 0)) || { usage; exit 2; }
+  case "$1" in
+    help|-h|--help) usage; return 0 ;;
+    --version) printf '%s\n' "$VERSION"; return 0 ;;
+  esac
+
+  preparse_config_args "$@"
+  load_config_file
   parse_args "$@"
+  finalize_defaults
+  validate_options
+
   need_cmd curl
   need_cmd jq
+
+  if [[ "$COMMAND" == "configure" ]]; then
+    ensure_state_dir
+    init_run_tmpdir
+    configure_connection
+    return 0
+  fi
+
   need_cmd base64
   need_cmd od
   normalize_api_base
@@ -888,6 +1112,7 @@ main() {
     status) show_status ;;
     test) test_current ;;
     rotate) rotate_warp ;;
+    rotation) manage_rotation ;;
     remove) remove_routes ;;
     rollback)
       local b
