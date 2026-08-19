@@ -4,7 +4,7 @@
 
 > 面向已经使用 [3x-ui](https://github.com/MHSanaei/3x-ui) 的 VPS 用户。脚本复用 3x-ui 原生 WARP WireGuard outbound，不安装 `warp-cli`、`redsocks`，也不会通过 `iptables OUTPUT` 劫持系统流量。
 
-当前版本：**v0.3.1**
+当前版本：**v0.3.2**
 
 ## 它解决什么问题？
 
@@ -50,6 +50,7 @@
 - **v0.3.0：首次注册优先使用 3x-ui 自带 Xray 的 `wg` 子命令，不再把系统 `wg` 作为硬依赖**
 - **v0.3.0：新增只读 `diagnose` 健康诊断命令**
 - **v0.3.1：检查 client inbound 是否启用 sniffing，避免 domain/geosite route test 通过但真实 IP 流量无法按域名分流**
+- **v0.3.2：使用 Xray `ruleTag` 标记 managed rules，不再把内部哨兵值写入实际 `domain` 列表；同时兼容清理 v0.3.1 生成的旧规则**
 
 ## 前置条件
 
@@ -255,7 +256,7 @@ v0.3.0 新增：
 
 ```text
 ========================================
-3xui-warp-router diagnosis v0.3.1
+3xui-warp-router diagnosis v0.3.2
 ========================================
 
 [OK  ] 3x-ui API                reachable and authenticated
@@ -579,7 +580,7 @@ Cloudflare WARP 不是可指定国家的传统 VPN。出口由 Cloudflare 网络
 
 这是 v0.2.0 及更早版本的首次注册限制。
 
-先更新到 v0.3.1：
+先更新到 v0.3.2：
 
 ```bash
 curl -fsSLo /usr/local/bin/3xui-warp-router \

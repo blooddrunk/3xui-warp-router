@@ -59,6 +59,43 @@ printf '%s\n' '{"inbounds":[{"tag":"api","protocol":"dokodemo-door"},{"tag":"in-
 enabled_output="$(check_inbound_sniffing "$enabled_cfg" test 2>&1)" || fail "enabled client inbounds should pass the sniffing check"
 assert_contains "$enabled_output" "enabled on 1 client inbound(s)"
 
+geosite_tokens_ok() { return 0; }
+PROFILE="google-web"
+YOUTUBE_MODE="direct"
+PRIORITY="prepend"
+managed_rules="$(build_managed_rules direct)"
+managed_domains="$(jq -r '.[].domain[]' <<<"$managed_rules")"
+assert_contains "$managed_domains" "geosite:google"
+assert_contains "$managed_domains" "geosite:youtube"
+assert_not_contains "$managed_domains" "$MARKER_WARP"
+assert_not_contains "$managed_domains" "$MARKER_DIRECT"
+assert_contains "$(jq -c '.[].ruleTag' <<<"$managed_rules")" "$RULE_TAG_WARP"
+assert_contains "$(jq -c '.[].ruleTag' <<<"$managed_rules")" "$RULE_TAG_DIRECT"
+
+managed_cfg="$TEST_TMPDIR/managed-config.json"
+printf '%s\n' '{"routing":{"rules":[{"type":"field","domain":["full:xui-warp-router-warp.invalid","domain:legacy.example"],"outboundTag":"warp"},{"type":"field","ruleTag":"xui-warp-router-warp","domain":["domain:stale.example"],"outboundTag":"warp"},{"type":"field","domain":["domain:user.example"],"outboundTag":"direct"}]},"outbounds":[{"tag":"warp","protocol":"wireguard"}]}' >"$managed_cfg"
+merge_managed_rules "$managed_cfg" "$managed_rules"
+managed_json="$(jq -c '.routing.rules' "$managed_cfg")"
+assert_not_contains "$managed_json" "$MARKER_WARP"
+assert_not_contains "$managed_json" "$MARKER_DIRECT"
+assert_contains "$managed_json" "geosite:google"
+assert_contains "$managed_json" "domain:user.example"
+
+merge_managed_rules "$managed_cfg" "$managed_rules"
+warp_rule_count="$(jq --arg tag "$RULE_TAG_WARP" '[.routing.rules[] | select(.ruleTag == $tag)] | length' "$managed_cfg")"
+direct_rule_count="$(jq --arg tag "$RULE_TAG_DIRECT" '[.routing.rules[] | select(.ruleTag == $tag)] | length' "$managed_cfg")"
+[[ "$warp_rule_count" == "1" ]] || fail "managed WARP rule should remain idempotent"
+[[ "$direct_rule_count" == "1" ]] || fail "managed direct rule should remain idempotent"
+
+managed_domains_after_merge="$(managed_domains_json "$managed_cfg" "$MARKER_WARP")"
+assert_contains "$managed_domains_after_merge" "geosite:google"
+assert_not_contains "$managed_domains_after_merge" "$MARKER_WARP"
+remove_managed_rules_from_file "$managed_cfg"
+remaining_json="$(jq -c '.routing.rules' "$managed_cfg")"
+assert_contains "$remaining_json" "domain:user.example"
+assert_not_contains "$remaining_json" "$RULE_TAG_WARP"
+assert_not_contains "$remaining_json" "$RULE_TAG_DIRECT"
+
 route_decision_json() {
   case "$1" in
     www.google.com) printf '%s\n' '{"matched":true,"outboundTag":"warp"}' ;;

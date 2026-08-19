@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.3.1"
+VERSION="0.3.2"
 SCRIPT_NAME="${0##*/}"
 
 API_BASE="${XUI_API_BASE:-}"
@@ -24,8 +24,15 @@ DEFAULT_CONFIG_DIR="${CONFIG_HOME%/}/3xui-warp-router"
 CONFIG_FILE="${XUI_WARP_CONFIG_FILE:-$DEFAULT_CONFIG_DIR/config}"
 CONFIG_DISABLED=0
 
+# Legacy domain markers used by v0.3.1 and earlier.  Keep recognizing them so
+# an apply/remove operation can migrate or clean up previously generated rules.
 MARKER_WARP="full:xui-warp-router-warp.invalid"
 MARKER_DIRECT="full:xui-warp-router-direct.invalid"
+
+# Xray supports ruleTag as a non-matching identifier.  New managed rules use
+# it instead of putting a synthetic domain token into the real domain list.
+RULE_TAG_WARP="xui-warp-router-warp"
+RULE_TAG_DIRECT="xui-warp-router-direct"
 
 CURL_COMMON=(
   --silent --show-error
@@ -700,19 +707,37 @@ build_managed_rules() {
   esac
 
   local warp_json direct_json
-  warp_json="$(printf '%s\n%s\n' "$MARKER_WARP" "$warp_lines" | awk 'NF && !seen[$0]++' | json_array_from_lines)"
+  warp_json="$(printf '%s\n' "$warp_lines" | awk 'NF && !seen[$0]++' | json_array_from_lines)"
   direct_json='[]'
-  [[ -z "$direct_lines" ]] || direct_json="$(printf '%s\n%s\n' "$MARKER_DIRECT" "$direct_lines" | awk 'NF && !seen[$0]++' | json_array_from_lines)"
-  jq -cn --arg warpTag "warp" --arg directTag "$direct_tag" --argjson warpDomains "$warp_json" --argjson directDomains "$direct_json" '
-    [(if ($directDomains|length)>0 then {type:"field",domain:$directDomains,outboundTag:$directTag} else empty end),{type:"field",domain:$warpDomains,outboundTag:$warpTag}]'
+  [[ -z "$direct_lines" ]] || direct_json="$(printf '%s\n' "$direct_lines" | awk 'NF && !seen[$0]++' | json_array_from_lines)"
+  jq -cn \
+    --arg warpTag "warp" \
+    --arg directTag "$direct_tag" \
+    --arg warpRuleTag "$RULE_TAG_WARP" \
+    --arg directRuleTag "$RULE_TAG_DIRECT" \
+    --argjson warpDomains "$warp_json" \
+    --argjson directDomains "$direct_json" '
+    [(if ($directDomains|length)>0 then {type:"field",ruleTag:$directRuleTag,domain:$directDomains,outboundTag:$directTag} else empty end),
+      {type:"field",ruleTag:$warpRuleTag,domain:$warpDomains,outboundTag:$warpTag}]'
 }
 
 merge_managed_rules() {
   local cfg_file="$1" managed_rules="$2" tmp
   tmp="$(new_tmp)"
-  jq --arg markerWarp "$MARKER_WARP" --arg markerDirect "$MARKER_DIRECT" --arg priority "$PRIORITY" --argjson managed "$managed_rules" '
+  jq \
+    --arg markerWarp "$MARKER_WARP" \
+    --arg markerDirect "$MARKER_DIRECT" \
+    --arg ruleTagWarp "$RULE_TAG_WARP" \
+    --arg ruleTagDirect "$RULE_TAG_DIRECT" \
+    --arg priority "$PRIORITY" \
+    --argjson managed "$managed_rules" '
     .routing=(.routing//{}) | .routing.rules=(.routing.rules//[])
-    | .routing.rules |= map(select(((.domain//[])|index($markerWarp))==null and ((.domain//[])|index($markerDirect))==null))
+    | .routing.rules |= map(select(
+        ((.ruleTag//"") != $ruleTagWarp)
+        and ((.ruleTag//"") != $ruleTagDirect)
+        and (((.domain//[])|index($markerWarp))==null)
+        and (((.domain//[])|index($markerDirect))==null)
+      ))
     | if $priority=="prepend" then .routing.rules=($managed+.routing.rules) else .routing.rules=(.routing.rules+$managed) end' "$cfg_file" >"$tmp"
   mv "$tmp" "$cfg_file"
 }
@@ -720,18 +745,33 @@ merge_managed_rules() {
 remove_managed_rules_from_file() {
   local cfg_file="$1" tmp
   tmp="$(new_tmp)"
-  jq --arg markerWarp "$MARKER_WARP" --arg markerDirect "$MARKER_DIRECT" '
-    if (.routing.rules?|type)=="array" then .routing.rules |= map(select(((.domain//[])|index($markerWarp))==null and ((.domain//[])|index($markerDirect))==null)) else . end' "$cfg_file" >"$tmp"
+  jq \
+    --arg markerWarp "$MARKER_WARP" \
+    --arg markerDirect "$MARKER_DIRECT" \
+    --arg ruleTagWarp "$RULE_TAG_WARP" \
+    --arg ruleTagDirect "$RULE_TAG_DIRECT" '
+    if (.routing.rules?|type)=="array" then
+      .routing.rules |= map(select(
+        ((.ruleTag//"") != $ruleTagWarp)
+        and ((.ruleTag//"") != $ruleTagDirect)
+        and (((.domain//[])|index($markerWarp))==null)
+        and (((.domain//[])|index($markerDirect))==null)
+      ))
+    else . end' "$cfg_file" >"$tmp"
   mv "$tmp" "$cfg_file"
 }
 
 managed_state_summary() {
   local cfg_file="$1"
-  jq -r --arg mw "$MARKER_WARP" --arg md "$MARKER_DIRECT" '
-    def managed($m): [.routing.rules[]? | select(((.domain//[])|index($m))!=null)];
+  jq -r \
+    --arg mw "$MARKER_WARP" \
+    --arg md "$MARKER_DIRECT" \
+    --arg rw "$RULE_TAG_WARP" \
+    --arg rd "$RULE_TAG_DIRECT" '
+    def managed($m; $r): [.routing.rules[]? | select((.ruleTag//"")==$r or (((.domain//[])|index($m))!=null))];
     "warp_outbound="+(if any(.outbounds[]?;.tag=="warp" and .protocol=="wireguard") then "present" else "missing" end),
-    "warp_rule_count="+((managed($mw)|length)|tostring),
-    "direct_rule_count="+((managed($md)|length)|tostring),
+    "warp_rule_count="+((managed($mw; $rw)|length)|tostring),
+    "direct_rule_count="+((managed($md; $rd)|length)|tostring),
     "warp_endpoint="+([.outbounds[]?|select(.tag=="warp")|.settings.peers[0].endpoint][0]//"n/a"),
     "warp_noKernelTun="+(([.outbounds[]?|select(.tag=="warp")|.settings.noKernelTun][0]//false)|tostring)' "$cfg_file"
 }
@@ -956,14 +996,30 @@ show_status() {
   jq '.xraySetting | if type=="string" then fromjson else . end' <<<"$payload" >"$cfg_file"
   managed_state_summary "$cfg_file"
   printf '\nManaged rules:\n'
-  jq -r --arg mw "$MARKER_WARP" --arg md "$MARKER_DIRECT" '.routing.rules[]? | select(((.domain//[])|index($mw))!=null or ((.domain//[])|index($md))!=null) | "- "+.outboundTag+": "+((.domain//[])|join(", "))' "$cfg_file"
+  jq -r \
+    --arg mw "$MARKER_WARP" \
+    --arg md "$MARKER_DIRECT" \
+    --arg rw "$RULE_TAG_WARP" \
+    --arg rd "$RULE_TAG_DIRECT" '
+    .routing.rules[]?
+    | select((.ruleTag//"")==$rw or (.ruleTag//"")==$rd or (((.domain//[])|index($mw))!=null) or (((.domain//[])|index($md))!=null))
+    | "- "+(.outboundTag//"")+": "+((.domain//[]) | map(select(. != $mw and . != $md)) | join(", "))' "$cfg_file"
   printf '\n3x-ui WARP rotation:\n'
   show_rotate_interval
 }
 
 managed_domains_json() {
-  local cfg_file="$1" marker="$2"
-  jq -c --arg m "$marker" '[.routing.rules[]? | select(((.domain//[])|index($m))!=null) | .domain[]? | select(.!=$m)]' "$cfg_file"
+  local cfg_file="$1" marker="$2" rule_tag
+  if [[ "$marker" == "$MARKER_WARP" ]]; then
+    rule_tag="$RULE_TAG_WARP"
+  else
+    rule_tag="$RULE_TAG_DIRECT"
+  fi
+  jq -c --arg m "$marker" --arg rt "$rule_tag" '
+    [.routing.rules[]?
+     | select((.ruleTag//"")==$rt or (((.domain//[])|index($m))!=null))
+     | (.domain//[])[]
+     | select(. != $m)]' "$cfg_file"
 }
 
 domain_expected_warp() {
@@ -1149,8 +1205,14 @@ diagnose() {
   fi
 
   local managed_warp_count managed_direct_count
-  managed_warp_count="$(jq --arg m "$MARKER_WARP" '[.routing.rules[]?|select(((.domain//[])|index($m))!=null)]|length' "$cfg_file")"
-  managed_direct_count="$(jq --arg m "$MARKER_DIRECT" '[.routing.rules[]?|select(((.domain//[])|index($m))!=null)]|length' "$cfg_file")"
+  managed_warp_count="$(jq \
+    --arg m "$MARKER_WARP" \
+    --arg r "$RULE_TAG_WARP" \
+    '[.routing.rules[]? | select((.ruleTag//"")==$r or (((.domain//[])|index($m))!=null))] | length' "$cfg_file")"
+  managed_direct_count="$(jq \
+    --arg m "$MARKER_DIRECT" \
+    --arg r "$RULE_TAG_DIRECT" \
+    '[.routing.rules[]? | select((.ruleTag//"")==$r or (((.domain//[])|index($m))!=null))] | length' "$cfg_file")"
   diag_line INFO "Managed rules" "warp=${managed_warp_count}, direct=${managed_direct_count}"
   if (( managed_warp_count == 0 )); then diag_line WARN "Managed routing" "no xui-warp-router WARP rule found"; warnings=$((warnings+1)); fi
 
