@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 SCRIPT_NAME="${0##*/}"
 
 API_BASE="${XUI_API_BASE:-}"
@@ -572,8 +572,56 @@ ensure_warp_account_and_outbound() {
 
 geosite_tokens_ok() {
   local csv="$1" issues
-  issues="$(api_post_obj_json "/xray/geodata/validate" "kind=false" "tokens=$csv")" || return 1
-  jq -e 'type == "array" and length == 0' >/dev/null <<<"$issues"
+
+  # Prefer the 3x-ui API when available.
+  if issues="$(api_post_obj_json "/xray/geodata/validate" "kind=false" "tokens=$csv" 2>/dev/null)"; then
+    jq -e 'type == "array" and length == 0' >/dev/null <<<"$issues"
+    return
+  fi
+
+  # Stable 3x-ui may not expose /xray/geodata/validate.
+  # Validate the same tokens with the local Xray core instead.
+  local xray_bin asset_dir tmp
+
+  xray_bin="$(find_xray_binary)" || return 1
+  asset_dir="${XRAY_LOCATION_ASSET:-$(dirname "$xray_bin")}"
+
+  [[ -f "$asset_dir/geosite.dat" ]] || return 1
+
+  tmp="$(mktemp --suffix=.json)"
+  chmod 600 "$tmp" 2>/dev/null || true
+
+  jq -n --arg csv "$csv" '
+    {
+      log: {loglevel: "error"},
+      inbounds: [],
+      outbounds: [
+        {
+          protocol: "freedom",
+          tag: "direct"
+        }
+      ],
+      routing: {
+        domainStrategy: "AsIs",
+        rules: [
+          {
+            type: "field",
+            domain: ($csv | split(",")),
+            outboundTag: "direct"
+          }
+        ]
+      }
+    }
+  ' >"$tmp"
+
+  if XRAY_LOCATION_ASSET="$asset_dir" \
+    "$xray_bin" run -test -config "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    return 0
+  fi
+
+  rm -f "$tmp"
+  return 1
 }
 
 json_array_from_lines() { jq -Rsc 'split("\n") | map(select(length > 0))'; }
@@ -688,9 +736,70 @@ managed_state_summary() {
     "warp_noKernelTun="+(([.outbounds[]?|select(.tag=="warp")|.settings.noKernelTun][0]//false)|tostring)' "$cfg_file"
 }
 
+inbound_sniffing_records() {
+  local cfg_file="$1"
+  jq -r '
+    (.inbounds // [])
+    | if type == "array" then . else [] end
+    | to_entries[]
+    | select((.value.tag // "") != "api")
+    | [
+        (.value.tag // ("inbound-" + (.key | tostring))),
+        (if ((.value.sniffing // {}).enabled == true) then "enabled" else "disabled" end)
+      ]
+    | @tsv
+  ' "$cfg_file"
+}
+
+check_inbound_sniffing() {
+  local cfg_file="$1" mode="${2:-warning}" tag state
+  local checked=0 disabled=0
+
+  while IFS=$'\t' read -r tag state; do
+    [[ -n "$tag" ]] || continue
+    checked=$((checked + 1))
+    [[ "$state" == "enabled" ]] || {
+      disabled=$((disabled + 1))
+      if [[ "$mode" == "test" || "$mode" == "diagnose" ]]; then
+        diag_line WARN "Inbound sniffing" "$tag disabled"
+      else
+        warn "inbound $tag has sniffing disabled."
+      fi
+    }
+  done < <(inbound_sniffing_records "$cfg_file")
+
+  if (( checked == 0 )); then
+    if [[ "$mode" == "test" || "$mode" == "diagnose" ]]; then
+      diag_line WARN "Inbound sniffing" "no client inbounds found"
+    else
+      warn "No client inbounds found; domain-based WARP routing cannot be verified."
+    fi
+    return 1
+  fi
+
+  if (( disabled > 0 )); then
+    if [[ "$mode" == "test" || "$mode" == "diagnose" ]]; then
+      diag_line WARN "Domain routing" "may not work when clients send resolved IP addresses"
+    else
+      warn "Domain-based WARP routing may not work when clients send resolved IP addresses."
+    fi
+    return 1
+  fi
+
+  if [[ "$mode" == "test" || "$mode" == "diagnose" ]]; then
+    diag_line OK "Inbound sniffing" "enabled on ${checked} client inbound(s)"
+  fi
+  return 0
+}
+
 route_decision_json() {
-  local domain="$1"
-  api_post_obj_json "/xray/routeTest" "domain=$domain" "port=443" "network=tcp"
+  local domain="$1" result
+  result="$(api_post_obj_json "/xray/routeTest" "domain=$domain" "port=443" "network=tcp")" || return 1
+  if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$result"; then
+    warn "3x-ui routeTest returned invalid JSON"
+    return 1
+  fi
+  printf '%s\n' "$result"
 }
 
 route_test() {
@@ -741,8 +850,11 @@ post_apply_test() {
   esac
   if [[ "$YOUTUBE_MODE" == "direct" && "$PROFILE" != "google-all" ]]; then
     local result tag
-    result="$(route_decision_json 'www.youtube.com')" || ok=1
-    tag="$(jq -r '.outboundTag // empty' <<<"${result:-{}}")"
+    if ! result="$(route_decision_json 'www.youtube.com')"; then
+      ok=1
+      result='{}'
+    fi
+    tag="$(jq -r '.outboundTag // empty' <<<"$result")"
     printf '%-28s -> %s (expected direct/default)\n' 'www.youtube.com' "${tag:-<default>}"
     [[ -z "$tag" || "$tag" == "$direct_tag" ]] || ok=1
   elif [[ "$YOUTUBE_MODE" == "warp" && "$PROFILE" != "google-all" ]]; then
@@ -765,6 +877,7 @@ apply_routes() {
     if [[ "$allow_bootstrap" == "yes" ]]; then ensure_warp_account_and_outbound "$cfg_file"; else die "No native 3x-ui WARP WireGuard outbound tagged 'warp'. Run '$SCRIPT_NAME bootstrap' or '$SCRIPT_NAME install'."; fi
   fi
 
+  check_inbound_sniffing "$cfg_file" apply || true
   direct_tag="$(find_direct_tag "$cfg_file")"
   managed="$(build_managed_rules "$direct_tag")"
   merge_managed_rules "$cfg_file" "$managed"
@@ -879,26 +992,34 @@ domain_expected_direct() {
 }
 
 test_current() {
-  local payload cfg_file direct_tag ok=0 result tag
+  local payload cfg_file direct_tag ok=0 warnings=0 result tag
   payload="$(fetch_xray_payload)" || die "Cannot read Xray settings"
   cfg_file="$(new_tmp)"
   jq '.xraySetting | if type=="string" then fromjson else . end' <<<"$payload" >"$cfg_file"
   has_warp_outbound "$cfg_file" || die "WARP outbound missing"
   direct_tag="$(find_direct_tag "$cfg_file")"
 
+  if ! check_inbound_sniffing "$cfg_file" test; then warnings=$((warnings + 1)); fi
   if domain_expected_warp "$cfg_file" google; then route_test 'www.google.com' 'warp' || ok=1; fi
   if domain_expected_warp "$cfg_file" gemini; then route_test 'gemini.google.com' 'warp' || ok=1; fi
   if domain_expected_warp "$cfg_file" youtube; then
     route_test 'www.youtube.com' 'warp' || ok=1
   elif domain_expected_direct "$cfg_file" youtube; then
-    result="$(route_decision_json 'www.youtube.com')" || ok=1
-    tag="$(jq -r '.outboundTag // empty' <<<"${result:-{}}")"
+    if ! result="$(route_decision_json 'www.youtube.com')"; then
+      ok=1
+      result='{}'
+    fi
+    tag="$(jq -r '.outboundTag // empty' <<<"$result")"
     printf '%-28s -> %s (expected direct/default)\n' 'www.youtube.com' "${tag:-<default>}"
     [[ -z "$tag" || "$tag" == "$direct_tag" ]] || ok=1
   fi
   outbound_test "$cfg_file" || ok=1
   (( ok == 0 )) || die "One or more tests failed"
-  log "Tests passed"
+  if (( warnings > 0 )); then
+    warn "Tests passed with warning(s); domain-based WARP routing is not guaranteed for every client inbound"
+  else
+    log "Tests passed"
+  fi
 }
 
 rotate_warp() {
@@ -967,6 +1088,8 @@ diagnose() {
     return 1
   fi
   diag_line OK "Xray config" "valid JSON"
+
+  if ! check_inbound_sniffing "$cfg_file" diagnose; then warnings=$((warnings + 1)); fi
 
   if route_decision_json 'www.google.com' >/dev/null 2>&1; then diag_line OK "Xray route API" "responsive"; else diag_line FAIL "Xray route API" "not responsive"; issues=$((issues+1)); fi
 

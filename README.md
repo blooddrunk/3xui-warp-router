@@ -4,7 +4,7 @@
 
 > 面向已经使用 [3x-ui](https://github.com/MHSanaei/3x-ui) 的 VPS 用户。脚本复用 3x-ui 原生 WARP WireGuard outbound，不安装 `warp-cli`、`redsocks`，也不会通过 `iptables OUTPUT` 劫持系统流量。
 
-当前版本：**v0.3.0**
+当前版本：**v0.3.1**
 
 ## 它解决什么问题？
 
@@ -49,6 +49,7 @@
 - 支持持久保存 API 配置，服务器重启后无需重新 export
 - **v0.3.0：首次注册优先使用 3x-ui 自带 Xray 的 `wg` 子命令，不再把系统 `wg` 作为硬依赖**
 - **v0.3.0：新增只读 `diagnose` 健康诊断命令**
+- **v0.3.1：检查 client inbound 是否启用 sniffing，避免 domain/geosite route test 通过但真实 IP 流量无法按域名分流**
 
 ## 前置条件
 
@@ -204,9 +205,10 @@ Google / Gemini 走 WARP，YouTube 保持直连：
 6. 通过 3x-ui WARP API 注册账号并生成 native WireGuard outbound。
 7. 检测 geosite 数据。
 8. 合并本脚本管理的 routing rules。
-9. 让 3x-ui/Xray 校验并保存配置。
-10. 执行 route test 与真实 WARP outbound test。
-11. 验证失败时默认回滚。
+9. 检查非 `api` client inbound 的 sniffing 状态；未启用时给出 WARNING。
+10. 让 3x-ui/Xray 校验并保存配置。
+11. 执行 route test 与真实 WARP outbound test。
+12. 验证失败时默认回滚。
 
 安装成功后建议立即：
 
@@ -235,6 +237,7 @@ v0.3.0 新增：
 - 3x-ui API 是否可访问、Token 是否有效
 - Xray 配置是否为有效 JSON
 - Xray route test API 是否响应
+- 非 `api` client inbound 是否启用了 sniffing
 - `warp` WireGuard outbound 是否存在
 - WARP endpoint / `noKernelTun` 状态
 - WARP outbound 实际连通性
@@ -252,11 +255,12 @@ v0.3.0 新增：
 
 ```text
 ========================================
-3xui-warp-router diagnosis v0.3.0
+3xui-warp-router diagnosis v0.3.1
 ========================================
 
 [OK  ] 3x-ui API                reachable and authenticated
 [OK  ] Xray config              valid JSON
+[OK  ] Inbound sniffing         enabled on 1 client inbound(s)
 [OK  ] Xray route API           responsive
 [OK  ] WARP outbound            present (wireguard)
 [INFO] WARP endpoint            engage.cloudflareclient.com:2408
@@ -451,7 +455,7 @@ status
 
 test
   严格验证当前 managed route + WARP outbound
-  失败返回非 0
+  失败返回非 0；client inbound 未启用 sniffing 时显示 warning
 
 diagnose
   更完整、可读、只读的故障诊断
@@ -558,11 +562,24 @@ Cloudflare WARP 不是可指定国家的传统 VPN。出口由 Cloudflare 网络
 
 ## 常见故障
 
+### `routeTest` 通过，但真实客户端没有按域名走 WARP
+
+`routeTest` 是对 Xray router 的合成域名查询，不会模拟客户端先把域名解析成 IP、再从 inbound 送入 Xray 的过程。对于这类流量，client inbound 需要启用 sniffing，才能从 TLS/HTTP 等协议中恢复域名并匹配 domain/geosite 规则。
+
+安装、`test` 和 `diagnose` 都会检查非 `api` inbound 的 `sniffing.enabled`。例如：
+
+```text
+[3xui-warp-router] WARNING: inbound in-28193-tcp has sniffing disabled.
+[3xui-warp-router] WARNING: Domain-based WARP routing may not work when clients send resolved IP addresses.
+```
+
+这是 warning 而不是自动修改：不同 inbound、协议和客户端的行为可能不同，脚本不会擅自改写已有 inbound 配置。请在 3x-ui 中确认对应 inbound 的 sniffing 设置，再运行 `3xui-warp-router test`。
+
 ### `Missing required command: wg`
 
 这是 v0.2.0 及更早版本的首次注册限制。
 
-先更新到 v0.3.0：
+先更新到 v0.3.1：
 
 ```bash
 curl -fsSLo /usr/local/bin/3xui-warp-router \
