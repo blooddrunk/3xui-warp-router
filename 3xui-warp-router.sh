@@ -812,11 +812,11 @@ route_test() {
 }
 
 outbound_probe_json() {
-  local cfg_file="$1" warp all
+  local cfg_file="$1" mode="${2:-real}" warp all
   warp="$(jq -c '.outbounds[]? | select(.tag=="warp")' "$cfg_file" | head -n 1)"
   [[ -n "$warp" ]] || return 1
   all="$(jq -c '.outbounds//[]' "$cfg_file")"
-  api_post_obj_json "/xray/testOutbound" "outbound=$warp" "allOutbounds=$all" "mode=real"
+  api_post_obj_json "/xray/testOutbound" "outbound=$warp" "allOutbounds=$all" "mode=$mode"
 }
 
 outbound_test() {
@@ -1105,7 +1105,7 @@ diagnose() {
     issues=$((issues+1))
   fi
 
-  if has_warp_outbound "$cfg_file" && probe="$(outbound_probe_json "$cfg_file" 2>/dev/null)"; then
+  if has_warp_outbound "$cfg_file" && probe="$(outbound_probe_json "$cfg_file" http 2>/dev/null)"; then
     local success ipv4 ipv6 country warp_state delay error
     success="$(jq -r 'if has("success") then .success else ((.error? // "")=="") end' <<<"$probe")"
     ipv4="$(jq -r '.egress.ipv4 // .egress.ip // empty' <<<"$probe")"

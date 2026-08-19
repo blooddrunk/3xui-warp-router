@@ -24,6 +24,20 @@ assert_not_contains() {
   [[ "$haystack" != *"$needle"* ]] || fail "expected output not to contain: $needle"
 }
 
+probe_cfg="$TEST_TMPDIR/warp-config.json"
+printf '%s\n' '{"outbounds":[{"tag":"warp","protocol":"wireguard"}]}' >"$probe_cfg"
+last_probe_args=()
+api_post_obj_json() {
+  last_probe_args=("$@")
+  printf '%s\n' '{"success":true}'
+}
+
+outbound_probe_json "$probe_cfg" >/dev/null || fail "default outbound probe should succeed"
+assert_contains "${last_probe_args[*]}" "mode=real"
+outbound_probe_json "$probe_cfg" http >/dev/null || fail "HTTP outbound probe should succeed"
+assert_contains "${last_probe_args[*]}" "mode=http"
+assert_not_contains "${last_probe_args[*]}" "mode=real"
+
 cfg_file="$TEST_TMPDIR/config.json"
 printf '%s\n' '{"inbounds":[{"tag":"api","protocol":"dokodemo-door"},{"tag":"in-28193-tcp","protocol":"vless","sniffing":{"enabled":false}},{"tag":"in-enabled","protocol":"vless","sniffing":{"enabled":true}}],"outbounds":[]}' >"$cfg_file"
 
