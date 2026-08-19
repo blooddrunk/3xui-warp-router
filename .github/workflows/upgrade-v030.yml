@@ -1,0 +1,761 @@
+name: Upgrade v0.3.0
+
+on:
+  push:
+    paths:
+      - .github/workflows/upgrade-v030.yml
+
+permissions:
+  contents: write
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch script and README
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_once(text, old, new, label):
+              if old not in text:
+                  raise SystemExit(f"missing anchor: {label}")
+              return text.replace(old, new, 1)
+
+          def regex_once(text, pattern, replacement, label):
+              text, n = re.subn(pattern, lambda m: replacement, text, count=1, flags=re.S)
+              if n != 1:
+                  raise SystemExit(f"regex anchor count for {label}: {n}")
+              return text
+
+          script_path = Path('3xui-warp-router.sh')
+          s = script_path.read_text()
+
+          s = replace_once(s, 'VERSION="0.2.0"', 'VERSION="0.3.0"', 'version')
+          s = replace_once(
+              s,
+              '  status        Show WARP outbound, routing, and auto-rotation state\n  test          Test the currently installed managed rules and WARP connectivity\n',
+              '  status        Show WARP outbound, routing, and auto-rotation state\n  diagnose      Diagnose Google/Gemini routes, Xray, WARP egress, and rotation\n  test          Test the currently installed managed rules and WARP connectivity\n',
+              'usage diagnose command',
+          )
+          s = replace_once(
+              s,
+              '  ./3xui-warp-router.sh test\n  ./3xui-warp-router.sh rotate\n',
+              '  ./3xui-warp-router.sh test\n  ./3xui-warp-router.sh diagnose\n  ./3xui-warp-router.sh rotate\n',
+              'usage diagnose example',
+          )
+          s = replace_once(
+              s,
+              '  * Initial WARP registration needs the `wg` command (wireguard-tools).\n    If WARP is already registered in 3x-ui, `wg` is not needed.\n',
+              '  * Initial WARP registration prefers the system `wg` command, then falls back\n    to the `wg` key generator built into 3x-ui/Xray. Set XUI_WARP_XRAY_BIN\n    if Xray is installed at a custom path.\n',
+              'usage registration note',
+          )
+
+          registration = r'''valid_wg_key() {
+            local key="$1" bytes
+            [[ -n "$key" ]] || return 1
+            bytes="$(printf '%s' "$key" | base64 -d 2>/dev/null | wc -c | tr -d '[:space:]')" || return 1
+            [[ "$bytes" == "32" ]]
+          }
+
+          find_xray_binary() {
+            local xarch=""
+            case "$(uname -m)" in
+              x86_64|amd64) xarch="amd64" ;;
+              i386|i486|i586|i686|x86) xarch="386" ;;
+              aarch64|arm64) xarch="arm64" ;;
+              armv7*|armv6*|arm) xarch="arm32" ;;
+              s390x) xarch="s390x" ;;
+            esac
+
+            local candidates=()
+            [[ -n "${XUI_WARP_XRAY_BIN:-}" ]] && candidates+=("$XUI_WARP_XRAY_BIN")
+            if command -v xray >/dev/null 2>&1; then
+              candidates+=("$(command -v xray)")
+            fi
+            if [[ -n "$xarch" ]]; then
+              candidates+=(
+                "/usr/local/x-ui/bin/xray-linux-$xarch"
+                "/opt/x-ui/bin/xray-linux-$xarch"
+              )
+            fi
+            candidates+=(
+              "/usr/local/x-ui/bin/xray"
+              "/opt/x-ui/bin/xray"
+              "/usr/local/bin/xray"
+              "/usr/bin/xray"
+            )
+
+            local candidate
+            for candidate in "${candidates[@]}"; do
+              [[ -x "$candidate" ]] || continue
+              printf '%s\n' "$candidate"
+              return 0
+            done
+
+            local root found
+            for root in /usr/local/x-ui/bin /opt/x-ui/bin; do
+              [[ -d "$root" ]] || continue
+              found="$(find "$root" -maxdepth 1 -type f -name 'xray-*' -perm -u+x -print 2>/dev/null | head -n 1 || true)"
+              if [[ -n "$found" ]]; then
+                printf '%s\n' "$found"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          xray_wg_keypair() {
+            local xray_bin="$1" output priv pub
+            output="$("$xray_bin" wg 2>&1)" || return 1
+            priv="$(awk -F': ' '/^PrivateKey:/ {print $2; exit}' <<<"$output")"
+            pub="$(awk -F': ' '/^Password \(PublicKey\):/ {print $2; exit}' <<<"$output")"
+            valid_wg_key "$priv" || return 1
+            valid_wg_key "$pub" || return 1
+            printf '%s\n%s\n' "$priv" "$pub"
+          }
+
+          generate_warp_keypair() {
+            local priv pub xray_bin
+
+            if command -v wg >/dev/null 2>&1; then
+              priv="$(wg genkey 2>/dev/null || true)"
+              if valid_wg_key "$priv"; then
+                pub="$(printf '%s' "$priv" | wg pubkey 2>/dev/null || true)"
+                if valid_wg_key "$pub"; then
+                  log "Using system WireGuard tools for initial WARP key generation"
+                  printf '%s\n%s\n' "$priv" "$pub"
+                  return 0
+                fi
+              fi
+              warn "System wg command is present but key generation failed; trying Xray fallback"
+            fi
+
+            if xray_bin="$(find_xray_binary)"; then
+              log "Using Xray built-in 'wg' key generator: $xray_bin"
+              if xray_wg_keypair "$xray_bin"; then
+                return 0
+              fi
+              warn "Xray was found but its 'wg' key generator failed"
+            fi
+
+            return 1
+          }
+
+          ensure_warp_account_and_outbound() {
+            local cfg_file="$1"
+            local data reg config outbound
+
+            if data="$(warp_account_data)"; then
+              log "Existing 3x-ui WARP account found"
+              config="$(api_post_obj_json "/xray/warp/config")" || die "Cannot fetch WARP config from 3x-ui"
+            else
+              local rc=$?
+              (( rc == 2 )) || die "Cannot query existing WARP account"
+              log "No WARP account found; registering through 3x-ui"
+
+              local pair priv pub
+              pair="$(generate_warp_keypair)" || die "Unable to generate WireGuard keys. Install wireguard-tools (Debian/Ubuntu: apt-get install -y wireguard-tools), or set XUI_WARP_XRAY_BIN=/path/to/xray if 3x-ui uses a custom Xray path."
+              [[ "$pair" == *$'\n'* ]] || die "Key generator returned an invalid key pair"
+              priv="${pair%%$'\n'*}"
+              pub="${pair#*$'\n'}"
+              valid_wg_key "$priv" || die "Generated WARP private key is invalid"
+              valid_wg_key "$pub" || die "Generated WARP public key is invalid"
+
+              reg="$(api_post_obj_json "/xray/warp/reg" "privateKey=$priv" "publicKey=$pub")" || die "3x-ui WARP registration failed"
+              data="$(jq -ce '.data' <<<"$reg")"
+              config="$(jq -ce '.config' <<<"$reg")"
+              unset pair priv pub
+            fi
+
+            outbound="$(build_warp_outbound "$data" "$config")"
+            local tmp
+            tmp="$(new_tmp)"
+            jq --argjson warp "$outbound" '
+              .outbounds = (.outbounds // [])
+              | if any(.outbounds[]?; .tag == "warp")
+                then .outbounds |= map(if .tag == "warp" then (. * $warp) else . end)
+                else .outbounds += [$warp]
+                end
+            ' "$cfg_file" >"$tmp"
+            mv "$tmp" "$cfg_file"
+          }'''
+
+          s = regex_once(
+              s,
+              r'ensure_warp_account_and_outbound\(\) \{\n.*?\n\}\n\ngeosite_tokens_ok\(\) \{',
+              registration + '\n\ngeosite_tokens_ok() {',
+              'WARP registration function',
+          )
+
+          outbound = r'''warp_probe_json() {
+            local cfg_file="$1"
+            local warp all
+            warp="$(jq -c '.outbounds[] | select(.tag == "warp")' "$cfg_file" | head -n 1)"
+            [[ -n "$warp" ]] || return 1
+            all="$(jq -c '.outbounds // []' "$cfg_file")"
+            api_post_obj_json "/xray/testOutbound" "outbound=$warp" "allOutbounds=$all" "mode=real"
+          }
+
+          warp_probe_ok() {
+            local result="$1"
+            jq -e '
+                if type != "object" then false
+                elif has("success") then .success == true
+                else ((.error? // "") == "") end
+              ' >/dev/null <<<"$result" || return 1
+
+            local egress_country egress_warp
+            egress_country="$(jq -r '.egress.country // empty' <<<"$result")"
+            egress_warp="$(jq -r '.egress.warp // empty' <<<"$result")"
+            [[ "$egress_warp" != "off" ]] || return 1
+            [[ "$egress_country" != "CN" ]] || return 1
+            return 0
+          }
+
+          outbound_test() {
+            local cfg_file="$1" result
+            result="$(warp_probe_json "$cfg_file")" || return 1
+            printf 'WARP outbound test: %s\n' "$(jq -c . <<<"$result")"
+
+            if ! warp_probe_ok "$result"; then
+              local egress_country egress_warp
+              egress_country="$(jq -r '.egress.country // empty' <<<"$result")"
+              egress_warp="$(jq -r '.egress.warp // empty' <<<"$result")"
+              if [[ "$egress_warp" == "off" ]]; then
+                warn "Outbound probe reached the Internet but Cloudflare trace reports warp=off"
+              elif [[ "$egress_country" == "CN" ]]; then
+                warn "WARP egress country is CN; this does not satisfy the anti-misclassification goal"
+              else
+                warn "WARP outbound probe reported failure"
+              fi
+              return 1
+            fi
+            return 0
+          }'''
+
+          s = regex_once(
+              s,
+              r'outbound_test\(\) \{\n.*?\n\}\n\nwait_for_route_api\(\) \{',
+              outbound + '\n\nwait_for_route_api() {',
+              'outbound probe block',
+          )
+
+          diagnose = r'''diagnose_current() {
+            local payload cfg_file
+            local problems=() warnings=()
+            local google_obj="" gemini_obj=""
+            local google_tag="<unavailable>" gemini_tag="<unavailable>"
+            local google_matched="false" gemini_matched="false"
+            local route_api_ok=0
+            local expect_google=0 expect_gemini=0
+            local managed_warp_rules=0
+
+            printf '3xui-warp-router diagnose v%s\n' "$VERSION"
+            printf '================================\n'
+
+            if ! payload="$(fetch_xray_payload)"; then
+              printf '\n[Panel / Xray]\n'
+              printf 'panel_api=failed\n'
+              printf '\n[Conclusion]\n'
+              printf 'diagnosis=UNHEALTHY\n'
+              printf 'problem=Cannot read Xray settings from 3x-ui. Check API URL, token, TLS, and panel availability.\n'
+              return 1
+            fi
+
+            cfg_file="$(new_tmp)"
+            jq '.xraySetting | if type == "string" then fromjson else . end' <<<"$payload" >"$cfg_file"
+
+            printf '\n[Panel / Xray]\n'
+            printf 'panel_api=ok\n'
+
+            local xray_result_json="" xray_result_text="" xray_result_state="unavailable"
+            if xray_result_json="$(api_get_obj_json "/xray/getXrayResult" 2>/dev/null)"; then
+              xray_result_text="$(jq -r 'if type == "string" then . else tostring end' <<<"$xray_result_json" 2>/dev/null || true)"
+              if [[ -n "$xray_result_text" ]]; then
+                xray_result_state="error-present"
+              else
+                xray_result_state="clean"
+              fi
+            fi
+            printf 'xray_last_result=%s\n' "$xray_result_state"
+
+            if google_obj="$(api_post_obj_json "/xray/routeTest" "domain=www.google.com" "port=443" "network=tcp" 2>/dev/null)"; then
+              google_matched="$(jq -r '.matched // false' <<<"$google_obj")"
+              google_tag="$(jq -r '.outboundTag // empty' <<<"$google_obj")"
+              [[ -n "$google_tag" ]] || google_tag="<default>"
+              route_api_ok=1
+            fi
+            if gemini_obj="$(api_post_obj_json "/xray/routeTest" "domain=gemini.google.com" "port=443" "network=tcp" 2>/dev/null)"; then
+              gemini_matched="$(jq -r '.matched // false' <<<"$gemini_obj")"
+              gemini_tag="$(jq -r '.outboundTag // empty' <<<"$gemini_obj")"
+              [[ -n "$gemini_tag" ]] || gemini_tag="<default>"
+              route_api_ok=1
+            fi
+
+            if (( route_api_ok )); then
+              printf 'xray_router=ok\n'
+            else
+              printf 'xray_router=unavailable\n'
+              problems+=("Xray route-test API is unavailable; Xray may be stopped or unhealthy.")
+            fi
+
+            managed_warp_rules="$(jq -r --arg m "$MARKER_WARP" '[.routing.rules[]? | select(((.domain // []) | index($m)) != null)] | length' "$cfg_file")"
+
+            if jq -e --arg m "$MARKER_WARP" '
+              any(.routing.rules[]?;
+                (((.domain // []) | index($m)) != null)
+                and (
+                  ((.domain // []) | index("geosite:google")) != null
+                  or ((.domain // []) | index("domain:google.com")) != null
+                  or ((.domain // []) | index("full:www.google.com")) != null
+                )
+              )
+            ' "$cfg_file" >/dev/null; then
+              expect_google=1
+            fi
+
+            if jq -e --arg m "$MARKER_WARP" '
+              any(.routing.rules[]?;
+                (((.domain // []) | index($m)) != null)
+                and (
+                  ((.domain // []) | index("geosite:google")) != null
+                  or ((.domain // []) | index("domain:google.com")) != null
+                  or ((.domain // []) | index("domain:gemini.google.com")) != null
+                  or ((.domain // []) | index("full:gemini.google.com")) != null
+                )
+              )
+            ' "$cfg_file" >/dev/null; then
+              expect_gemini=1
+            fi
+
+            local google_expected="not-forced" gemini_expected="not-forced"
+            (( expect_google )) && google_expected="warp"
+            (( expect_gemini )) && gemini_expected="warp"
+
+            printf '\n[Routing]\n'
+            printf 'managed_warp_rules=%s\n' "$managed_warp_rules"
+            printf 'google_route=%s (matched=%s, managed_expected=%s)\n' "$google_tag" "$google_matched" "$google_expected"
+            printf 'gemini_route=%s (matched=%s, managed_expected=%s)\n' "$gemini_tag" "$gemini_matched" "$gemini_expected"
+
+            if (( expect_google )) && [[ "$google_tag" != "warp" ]]; then
+              problems+=("Google is covered by the managed WARP rule but routeTest does not select warp.")
+            elif [[ "$google_tag" == "<unavailable>" ]]; then
+              warnings+=("Google route could not be queried.")
+            fi
+            if (( expect_gemini )) && [[ "$gemini_tag" != "warp" ]]; then
+              problems+=("Gemini is covered by the managed WARP rule but routeTest does not select warp.")
+            elif [[ "$gemini_tag" == "<unavailable>" ]]; then
+              warnings+=("Gemini route could not be queried.")
+            fi
+            if (( managed_warp_rules > 0 && expect_google == 0 && expect_gemini == 0 )) && [[ "$google_tag" != "warp" && "$gemini_tag" != "warp" ]]; then
+              warnings+=("Managed WARP rules exist, but neither Google nor Gemini is recognizably targeted; this may be intentional with a custom profile.")
+            fi
+
+            printf '\n[WARP]\n'
+            local account_state="missing" account="" account_rc=0
+            if account="$(warp_account_data 2>/dev/null)"; then
+              account_state="present"
+            else
+              account_rc=$?
+              if (( account_rc == 1 )); then
+                account_state="unavailable"
+              fi
+            fi
+            unset account
+            printf 'warp_account=%s\n' "$account_state"
+
+            local warp_outbound_state="missing" warp_endpoint="n/a" warp_no_kernel="n/a"
+            if has_warp_outbound "$cfg_file"; then
+              warp_outbound_state="present"
+              warp_endpoint="$(jq -r '[.outbounds[]? | select(.tag=="warp") | .settings.peers[0].endpoint][0] // "n/a"' "$cfg_file")"
+              warp_no_kernel="$(jq -r '[.outbounds[]? | select(.tag=="warp") | .settings.noKernelTun][0] // false' "$cfg_file")"
+              if ! jq -e '
+                [.outbounds[]? | select(.tag=="warp" and .protocol=="wireguard")] as $w
+                | ($w|length) > 0
+                  and ((($w[0].settings.secretKey // "") | length) > 0)
+                  and ((($w[0].settings.address // []) | length) > 0)
+                  and ((($w[0].settings.peers[0].publicKey // "") | length) > 0)
+                  and ((($w[0].settings.peers[0].endpoint // "") | length) > 0)
+              ' "$cfg_file" >/dev/null; then
+                warp_outbound_state="incomplete"
+                problems+=("The warp outbound exists but required WireGuard fields are incomplete.")
+              fi
+            else
+              problems+=("No native WireGuard outbound tagged 'warp' is present.")
+            fi
+            printf 'warp_outbound=%s\n' "$warp_outbound_state"
+            printf 'warp_endpoint=%s\n' "$warp_endpoint"
+            printf 'warp_noKernelTun=%s\n' "$warp_no_kernel"
+
+            if [[ "$account_state" != "present" ]]; then
+              warnings+=("3x-ui WARP account metadata is not available; current traffic may still work, but rotate/re-registration can fail.")
+            fi
+
+            local probe="" probe_success="false" egress_ipv4="" egress_ipv6="" egress_country="" egress_warp="" egress_delay=""
+            if [[ "$warp_outbound_state" != "missing" ]] && probe="$(warp_probe_json "$cfg_file" 2>/dev/null)"; then
+              probe_success="$(jq -r '.success // false' <<<"$probe")"
+              egress_ipv4="$(jq -r '.egress.ipv4 // empty' <<<"$probe")"
+              egress_ipv6="$(jq -r '.egress.ipv6 // empty' <<<"$probe")"
+              egress_country="$(jq -r '.egress.country // empty' <<<"$probe")"
+              egress_warp="$(jq -r '.egress.warp // empty' <<<"$probe")"
+              egress_delay="$(jq -r '.delay // empty' <<<"$probe")"
+            fi
+
+            printf 'warp_probe_success=%s\n' "$probe_success"
+            printf 'egress_ipv4=%s\n' "${egress_ipv4:-n/a}"
+            printf 'egress_ipv6=%s\n' "${egress_ipv6:-n/a}"
+            printf 'egress_country=%s\n' "${egress_country:-n/a}"
+            printf 'cloudflare_warp=%s\n' "${egress_warp:-n/a}"
+            printf 'probe_delay_ms=%s\n' "${egress_delay:-n/a}"
+
+            if [[ "$probe_success" != "true" ]]; then
+              problems+=("WARP outbound connectivity probe failed.")
+            fi
+            if [[ "$egress_warp" == "off" ]]; then
+              problems+=("Cloudflare trace reports warp=off for the tested outbound.")
+            fi
+            if [[ "$egress_country" == "CN" ]]; then
+              problems+=("WARP egress country is CN, which does not satisfy the anti-misclassification goal.")
+            fi
+            if [[ "$probe_success" == "true" && -z "$egress_country" ]]; then
+              warnings+=("WARP probe succeeded but 3x-ui did not report an egress country.")
+            fi
+            if [[ "$probe_success" == "true" && -z "$egress_ipv4" && -z "$egress_ipv6" ]]; then
+              warnings+=("WARP probe succeeded but 3x-ui did not report an egress IP.")
+            fi
+
+            printf '\n[Auto rotation]\n'
+            local rotate_days=""
+            if rotate_days="$(get_rotate_interval 2>/dev/null)"; then
+              if [[ "$rotate_days" =~ ^[0-9]+$ ]] && (( rotate_days > 0 )); then
+                printf 'warp_auto_rotation=%s day(s)\n' "$rotate_days"
+              else
+                printf 'warp_auto_rotation=disabled\n'
+              fi
+            else
+              printf 'warp_auto_rotation=unknown\n'
+              warnings+=("Could not read 3x-ui WARP auto-rotation interval.")
+            fi
+
+            if [[ "$xray_result_state" == "error-present" ]]; then
+              if (( route_api_ok )); then
+                warnings+=("3x-ui reports a recent Xray error/result even though the route API currently responds; inspect Xray logs if this repeats.")
+              else
+                problems+=("3x-ui reports an Xray process error/result and routing is unavailable.")
+              fi
+            elif [[ "$xray_result_state" == "unavailable" ]]; then
+              warnings+=("Could not read the Xray process result endpoint.")
+            fi
+
+            printf '\n[Conclusion]\n'
+            local item
+            if ((${#problems[@]} > 0)); then
+              printf 'diagnosis=UNHEALTHY\n'
+              printf 'summary=One or more critical routing/WARP checks failed.\n'
+              for item in "${problems[@]}"; do
+                printf 'problem=%s\n' "$item"
+              done
+              for item in "${warnings[@]}"; do
+                printf 'warning=%s\n' "$item"
+              done
+              if [[ "$egress_country" == "CN" ]]; then
+                printf 'recommendation=Run `%s rotate`, then run `%s diagnose` again.\n' "$SCRIPT_NAME" "$SCRIPT_NAME"
+              elif [[ "$warp_outbound_state" == "missing" || "$warp_outbound_state" == "incomplete" ]]; then
+                printf 'recommendation=Run `%s install` (or `bootstrap`) to repair the native WARP outbound.\n' "$SCRIPT_NAME"
+              elif (( expect_google )) && [[ "$google_tag" != "warp" ]] || (( expect_gemini )) && [[ "$gemini_tag" != "warp" ]]; then
+                printf 'recommendation=Re-apply the intended routing profile, then diagnose again.\n'
+              else
+                printf 'recommendation=Check 3x-ui/Xray logs and WARP connectivity, repair the failing item, then diagnose again.\n'
+              fi
+              rm -f "$cfg_file"
+              return 1
+            fi
+
+            if ((${#warnings[@]} > 0)); then
+              printf 'diagnosis=DEGRADED\n'
+              printf 'summary=Core WARP connectivity is usable, but one or more non-critical checks need attention.\n'
+              for item in "${warnings[@]}"; do
+                printf 'warning=%s\n' "$item"
+              done
+            else
+              printf 'diagnosis=HEALTHY\n'
+              printf 'summary=Xray routing and the WARP egress path look healthy.\n'
+            fi
+
+            local targets=()
+            [[ "$google_tag" == "warp" ]] && targets+=("Google")
+            [[ "$gemini_tag" == "warp" ]] && targets+=("Gemini")
+            if ((${#targets[@]} > 0)); then
+              local joined="${targets[*]}"
+              printf 'targets_via_warp=%s\n' "$joined"
+            fi
+            if [[ -n "$egress_country" || -n "$egress_ipv4" || -n "$egress_ipv6" ]]; then
+              printf 'egress_summary=%s / %s\n' "${egress_country:-unknown-country}" "${egress_ipv4:-${egress_ipv6:-unknown-ip}}"
+            fi
+
+            rm -f "$cfg_file"
+            return 0
+          }'''
+
+          s = replace_once(s, '\nlist_backups() {', '\n' + diagnose + '\n\nlist_backups() {', 'diagnose function insertion')
+          s = replace_once(s, '    status) show_status ;;\n    test) test_current ;;', '    status) show_status ;;\n    diagnose) diagnose_current ;;\n    test) test_current ;;', 'diagnose main case')
+          script_path.write_text(s)
+
+          readme_path = Path('README.md')
+          r = readme_path.read_text()
+          r = replace_once(
+              r,
+              '- 支持 3x-ui 原生 WARP 定时轮换\n',
+              '- 支持 3x-ui 原生 WARP 定时轮换\n- 提供 `diagnose`：一次检查 Google/Gemini 路由、WARP 出口 IP/国家、自动轮换与基础健康状态\n',
+              'README feature bullet',
+          )
+
+          old_prereq = '''如果 3x-ui **还没有注册过 WARP**，首次运行还需要：
+
+```bash
+wg
+```
+
+Debian / Ubuntu：
+
+```bash
+sudo apt update
+sudo apt install -y curl jq wireguard-tools
+```
+
+如果你已经在 3x-ui 中注册并配置好了 WARP，`wireguard-tools` 通常不再是必须项。'''
+          new_prereq = '''首次注册 WARP 时需要生成一对 WireGuard/X25519 密钥。v0.3.0 起脚本会自动按下面顺序选择生成器：
+
+```text
+系统 wg（wireguard-tools）
+        ↓ 不可用/失败
+3x-ui 自带 Xray 的 `xray wg`
+        ↓ 仍不可用
+给出明确安装/路径提示后停止
+```
+
+因此 **`wireguard-tools` 不再是首次注册的硬依赖**。标准 3x-ui 安装通常已经带有可用的 Xray；脚本会自动寻找 `/usr/local/x-ui/bin/xray-linux-*` 等常见路径。
+
+基础依赖（Debian / Ubuntu）：
+
+```bash
+sudo apt update
+sudo apt install -y curl jq
+```
+
+如果你的 Xray 位于非标准路径，可以显式指定：
+
+```bash
+export XUI_WARP_XRAY_BIN='/custom/path/to/xray'
+```
+
+只有系统 `wg` 和 Xray 的 `wg` 子命令都不可用时，才需要额外安装：
+
+```bash
+sudo apt install -y wireguard-tools
+```'''
+          r = replace_once(r, old_prereq, new_prereq, 'README prerequisites')
+
+          test_anchor = '''### 测试当前配置
+
+```bash
+3xui-warp-router test
+```
+
+脚本会检查 routing decision，并调用 3x-ui 的 outbound connectivity test。
+'''
+          diagnose_doc = '''### 测试当前配置
+
+```bash
+3xui-warp-router test
+```
+
+脚本会检查 routing decision，并调用 3x-ui 的 outbound connectivity test。
+
+### 一键诊断
+
+```bash
+3xui-warp-router diagnose
+```
+
+`diagnose` 会一次性读取并汇总：
+
+- `www.google.com` 当前由哪个 outbound 接管；
+- `gemini.google.com` 当前由哪个 outbound 接管；
+- 3x-ui / Xray route-test API 是否可用；
+- WARP 账号元数据是否存在；
+- `warp` WireGuard outbound 是否完整；
+- WARP outbound 实际连通性；
+- Cloudflare trace 返回的 WARP 出口 IPv4 / IPv6、国家和 `warp` 状态；
+- 3x-ui WARP 自动换 IP 的当前间隔；
+- 最终 `HEALTHY` / `DEGRADED` / `UNHEALTHY` 诊断结论和修复建议。
+
+典型健康输出会类似：
+
+```text
+[Routing]
+google_route=warp (matched=true, managed_expected=warp)
+gemini_route=warp (matched=true, managed_expected=warp)
+
+[WARP]
+warp_outbound=present
+warp_probe_success=true
+egress_ipv4=198.51.100.10
+egress_country=US
+cloudflare_warp=on
+
+[Auto rotation]
+warp_auto_rotation=disabled
+
+[Conclusion]
+diagnosis=HEALTHY
+summary=Xray routing and the WARP egress path look healthy.
+```
+
+如果有关键故障，`diagnose` 会以非零状态退出，因此也适合后续接入简单的健康检查脚本。它不会输出 API Token、WARP private key 或完整 Xray 配置。
+'''
+          r = replace_once(r, test_anchor, diagnose_doc, 'README diagnose section')
+          r = replace_once(r, 'XUI_WARP_CONFIG_FILE\n', 'XUI_WARP_CONFIG_FILE\nXUI_WARP_XRAY_BIN\n', 'README xray env var')
+          readme_path.write_text(r)
+          PY
+
+      - name: Syntax and helper tests
+        shell: bash
+        run: |
+          bash -n ./3xui-warp-router.sh
+          bash -lc '
+            source ./3xui-warp-router.sh
+            tmp="$(mktemp -d)"
+            trap "rm -rf $tmp" EXIT
+            cat >"$tmp/xray" <<"EOF"
+          #!/usr/bin/env bash
+          if [[ "${1:-}" == "wg" ]]; then
+            cat <<"OUT"
+          PrivateKey: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
+          Password (PublicKey): Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA=
+          Hash32: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          OUT
+            exit 0
+          fi
+          exit 1
+          EOF
+            chmod +x "$tmp/xray"
+            PATH="$tmp:$PATH"
+            wg() { return 1; }
+            pair="$(generate_warp_keypair)"
+            [[ "${pair%%$'"'"'\n'"'"'*}" == "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" ]]
+            [[ "${pair#*$'"'"'\n'"'"'}" == "Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA=" ]]
+            warp_probe_ok '"'"'{"success":true,"egress":{"country":"US","warp":"on"}}'"'"'
+            if warp_probe_ok '"'"'{"success":true,"egress":{"country":"CN","warp":"on"}}'"'"'; then
+              echo "CN probe should fail" >&2
+              exit 1
+            fi
+          '
+
+      - name: Diagnose mock integration test
+        shell: bash
+        run: |
+          cat >/tmp/mock_3xui.py <<'PY'
+          import json
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          cfg = {
+              "outbounds": [
+                  {"tag": "direct", "protocol": "freedom", "settings": {}},
+                  {
+                      "tag": "warp",
+                      "protocol": "wireguard",
+                      "settings": {
+                          "secretKey": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+                          "address": ["172.16.0.2/32", "2606:4700:110:8::2/128"],
+                          "reserved": [1, 2, 3],
+                          "peers": [{"publicKey": "Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA=", "endpoint": "engage.cloudflareclient.com:2408"}],
+                          "noKernelTun": True,
+                      },
+                  },
+              ],
+              "routing": {
+                  "rules": [
+                      {
+                          "type": "field",
+                          "domain": ["full:xui-warp-router-warp.invalid", "geosite:google"],
+                          "outboundTag": "warp",
+                      }
+                  ]
+              },
+          }
+
+          class H(BaseHTTPRequestHandler):
+              def log_message(self, *args):
+                  pass
+
+              def send_obj(self, obj):
+                  body = json.dumps({"success": True, "obj": obj}).encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def do_GET(self):
+                  if self.path == "/panel/api/xray/getXrayResult":
+                      self.send_obj("")
+                  else:
+                      self.send_error(404)
+
+              def do_POST(self):
+                  length = int(self.headers.get("Content-Length", "0"))
+                  body = self.rfile.read(length).decode()
+                  if self.path == "/panel/api/xray/":
+                      self.send_obj({"xraySetting": cfg, "outboundTestUrl": "https://www.google.com/generate_204"})
+                  elif self.path == "/panel/api/xray/routeTest":
+                      self.send_obj({"matched": True, "outboundTag": "warp", "groupTags": []})
+                  elif self.path == "/panel/api/xray/testOutbound":
+                      self.send_obj({"tag": "warp", "success": True, "delay": 37, "egress": {"ipv4": "198.51.100.10", "country": "US", "warp": "on"}})
+                  elif self.path == "/panel/api/setting/all":
+                      self.send_obj({"warpUpdateInterval": 0})
+                  elif self.path == "/panel/api/xray/warp/data":
+                      self.send_obj({"private_key": "redacted", "client_id": "AQID"})
+                  else:
+                      self.send_error(404)
+
+          HTTPServer(("127.0.0.1", 18080), H).serve_forever()
+          PY
+
+          python3 /tmp/mock_3xui.py &
+          mock_pid=$!
+          trap 'kill "$mock_pid" 2>/dev/null || true' EXIT
+          sleep 0.3
+          printf 'test-token\n' >/tmp/3xui-token
+          chmod 600 /tmp/3xui-token
+
+          ./3xui-warp-router.sh diagnose \
+            --api-base http://127.0.0.1:18080/panel/api \
+            --token-file /tmp/3xui-token \
+            --no-config > /tmp/diagnose.out
+
+          cat /tmp/diagnose.out
+          grep -F 'google_route=warp' /tmp/diagnose.out
+          grep -F 'gemini_route=warp' /tmp/diagnose.out
+          grep -F 'egress_ipv4=198.51.100.10' /tmp/diagnose.out
+          grep -F 'egress_country=US' /tmp/diagnose.out
+          grep -F 'warp_auto_rotation=disabled' /tmp/diagnose.out
+          grep -F 'diagnosis=HEALTHY' /tmp/diagnose.out
+
+      - name: Commit verified upgrade
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add 3xui-warp-router.sh README.md
+          if git diff --cached --quiet; then
+            echo 'No changes to commit'
+            exit 0
+          fi
+          git commit -m 'feat: improve WARP registration and add diagnose'
+          git push
