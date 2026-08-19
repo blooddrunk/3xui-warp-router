@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 SCRIPT_NAME="${0##*/}"
 
 API_BASE="${XUI_API_BASE:-}"
@@ -76,6 +76,7 @@ Commands:
   apply         Apply/update managed routing rules; requires a warp outbound
   status        Show WARP outbound, routing, and auto-rotation state
   test          Test the currently installed managed rules and WARP connectivity
+  diagnose      Read-only health report for API, Xray, WARP, routes, and rotation
   rotate        Ask 3x-ui to rotate WARP IP, then test current installed rules
   rotation      Show or set 3x-ui WARP auto-rotation without changing routing
   remove        Remove only routing rules managed by this script
@@ -111,24 +112,18 @@ Safety options:
   -h, --help          Show this help
 
 Examples:
-  # Recommended one-time persistent setup. The token is stored in a 0600 file.
   ./3xui-warp-router.sh configure --api-base 'https://panel.example.com:2053/panel/api'
   ./3xui-warp-router.sh install --profile google-web --youtube direct
-
-  # Or use temporary shell environment variables instead.
-  export XUI_API_BASE='https://panel.example.com:2053/panel/api'
-  export XUI_API_TOKEN='...token from Settings -> Security -> API Token...'
-
+  ./3xui-warp-router.sh diagnose
   ./3xui-warp-router.sh test
   ./3xui-warp-router.sh rotate
   ./3xui-warp-router.sh rotation --rotate-days 7
-  ./3xui-warp-router.sh remove
-  ./3xui-warp-router.sh rollback
 
 Notes:
-  * Initial WARP registration needs the `wg` command (wireguard-tools).
-    If WARP is already registered in 3x-ui, `wg` is not needed.
+  * Initial WARP registration prefers the Xray-core `wg` subcommand already
+    shipped with 3x-ui. The system `wg` command is only a fallback.
   * The script never edits x-ui.db directly.
+  * diagnose is read-only and never changes routes, WARP registration, or IP.
   * Backups contain the Xray config, including WARP private-key material.
     They are stored with mode 0600 inside a 0700 directory.
 USAGE
@@ -158,9 +153,7 @@ preparse_config_args() {
         CONFIG_DISABLED=1
         i=$((i + 1))
         ;;
-      *)
-        i=$((i + 1))
-        ;;
+      *) i=$((i + 1)) ;;
     esac
   done
 }
@@ -226,9 +219,7 @@ ensure_token() {
   if [[ -z "$API_TOKEN" && -n "$TOKEN_FILE" ]]; then
     [[ -f "$TOKEN_FILE" ]] || die "API token file not found: $TOKEN_FILE"
     [[ -r "$TOKEN_FILE" ]] || die "API token file is not readable: $TOKEN_FILE"
-    if [[ -L "$TOKEN_FILE" ]]; then
-      warn "API token file is a symlink: $TOKEN_FILE"
-    fi
+    [[ ! -L "$TOKEN_FILE" ]] || warn "API token file is a symlink: $TOKEN_FILE"
     local mode
     mode="$(stat -c '%a' "$TOKEN_FILE" 2>/dev/null || true)"
     if [[ "$mode" =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 077) != 0 )); then
@@ -280,20 +271,8 @@ write_persistent_config() {
   mv "$config_tmp" "$CONFIG_FILE"
   chmod 600 "$token_dest" "$CONFIG_FILE" 2>/dev/null || true
   TOKEN_FILE="$token_dest"
-
   log "Saved persistent config: $CONFIG_FILE"
   log "Saved API token file: $TOKEN_FILE (mode 0600)"
-}
-
-configure_connection() {
-  normalize_api_base
-  ensure_token
-  init_curl
-  if ! fetch_xray_payload >/dev/null; then
-    die "Cannot authenticate to 3x-ui with the supplied API base/token; nothing was saved"
-  fi
-  write_persistent_config
-  log "Configuration verified. Future commands can run without export after reboot."
 }
 
 api_post() {
@@ -324,13 +303,7 @@ assert_success() {
 obj_json_from_body() {
   local body="$1"
   assert_success "$body" || return 1
-  jq -ce '
-    .obj
-    | if type == "string" and length > 0
-      then (try fromjson catch .)
-      else .
-      end
-  ' <<<"$body"
+  jq -ce '.obj | if type == "string" and length > 0 then (try fromjson catch .) else . end' <<<"$body"
 }
 
 api_post_obj_json() {
@@ -356,11 +329,15 @@ fetch_xray_payload() {
   api_post_obj_json "/xray/"
 }
 
-extract_xray_config() {
-  jq -ce '
-    .xraySetting
-    | if type == "string" then fromjson else . end
-  '
+configure_connection() {
+  normalize_api_base
+  ensure_token
+  init_curl
+  if ! fetch_xray_payload >/dev/null; then
+    die "Cannot authenticate to 3x-ui with the supplied API base/token; nothing was saved"
+  fi
+  write_persistent_config
+  log "Configuration verified. Future commands can run without export after reboot."
 }
 
 backup_payload() {
@@ -387,10 +364,8 @@ latest_backup() {
 }
 
 save_config_file() {
-  local cfg_file="$1"
-  local test_url="$2"
+  local cfg_file="$1" test_url="$2"
   jq -e . "$cfg_file" >/dev/null || die "Refusing to save invalid JSON: $cfg_file"
-
   local args=("${CURL_COMMON[@]}" -X POST
     --data-urlencode "xraySetting@${cfg_file}"
     --data-urlencode "outboundTestUrl=${test_url}"
@@ -403,8 +378,7 @@ save_config_file() {
 restore_backup_file() {
   local cfg_file="$1"
   [[ -f "$cfg_file" ]] || die "Backup not found: $cfg_file"
-  local meta_file="${cfg_file%.json}.meta.json"
-  local test_url="https://www.google.com/generate_204"
+  local meta_file="${cfg_file%.json}.meta.json" test_url="https://www.google.com/generate_204"
   if [[ -f "$meta_file" ]]; then
     test_url="$(jq -r '.outboundTestUrl // "https://www.google.com/generate_204"' "$meta_file")"
   fi
@@ -439,6 +413,84 @@ warp_account_data() {
   printf '%s\n' "$data"
 }
 
+find_xray_binary() {
+  local candidate
+  if [[ -n "${XRAY_BIN:-}" && -x "${XRAY_BIN}" ]]; then
+    printf '%s\n' "$XRAY_BIN"
+    return 0
+  fi
+  if command -v xray >/dev/null 2>&1; then
+    command -v xray
+    return 0
+  fi
+  for candidate in \
+    /usr/local/x-ui/bin/xray \
+    /usr/local/x-ui/bin/xray-linux-amd64 \
+    /usr/local/x-ui/bin/xray-linux-arm64 \
+    /usr/local/x-ui/bin/xray-linux-arm32 \
+    /usr/local/x-ui/xray; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  while IFS= read -r candidate; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(find /usr/local/x-ui /opt/x-ui -maxdepth 3 -type f -name 'xray*' 2>/dev/null | sort)
+  return 1
+}
+
+generate_keypair_with_xray() {
+  local xray_bin="$1" output priv pub
+  output="$("$xray_bin" wg 2>/dev/null)" || return 1
+  priv="$(awk -F': ' '/^PrivateKey:/ {print $2; exit}' <<<"$output")"
+  pub="$(awk -F': ' '/^Password \(PublicKey\):/ {print $2; exit}' <<<"$output")"
+  [[ "$priv" =~ ^[A-Za-z0-9+/]{43}=$ ]] || return 1
+  [[ "$pub" =~ ^[A-Za-z0-9+/]{43}=$ ]] || return 1
+  jq -cn --arg privateKey "$priv" --arg publicKey "$pub" '{privateKey:$privateKey,publicKey:$publicKey}'
+}
+
+generate_keypair_with_wg() {
+  command -v wg >/dev/null 2>&1 || return 1
+  local priv pub
+  priv="$(wg genkey 2>/dev/null)" || return 1
+  pub="$(printf '%s' "$priv" | wg pubkey 2>/dev/null)" || return 1
+  [[ -n "$priv" && -n "$pub" ]] || return 1
+  jq -cn --arg privateKey "$priv" --arg publicKey "$pub" '{privateKey:$privateKey,publicKey:$publicKey}'
+}
+
+generate_wireguard_keypair() {
+  local xray_bin pair
+  if xray_bin="$(find_xray_binary)"; then
+    if pair="$(generate_keypair_with_xray "$xray_bin")"; then
+      log "Generated WARP registration keypair with Xray: $xray_bin"
+      printf '%s\n' "$pair"
+      return 0
+    fi
+    warn "Found Xray at $xray_bin, but its 'wg' key generator is unavailable; trying system wg"
+  fi
+  if pair="$(generate_keypair_with_wg)"; then
+    log "Generated WARP registration keypair with system wg"
+    printf '%s\n' "$pair"
+    return 0
+  fi
+  cat >&2 <<'MSG'
+[3xui-warp-router] ERROR: Cannot generate a WireGuard keypair for first-time WARP registration.
+Tried:
+  1. 3x-ui/Xray-core `xray wg`
+  2. system `wg genkey` / `wg pubkey`
+
+For Debian/Ubuntu, install the fallback tool with:
+  apt update && apt install -y wireguard-tools
+
+You can also upgrade 3x-ui/Xray-core to a version whose Xray binary supports `wg`.
+MSG
+  return 1
+}
+
 bytes_json_from_base64() {
   local value="$1"
   [[ -n "$value" ]] || { printf '[]\n'; return; }
@@ -456,9 +508,7 @@ bytes_json_from_base64() {
 }
 
 build_warp_outbound() {
-  local data_json="$1"
-  local config_json="$2"
-
+  local data_json="$1" config_json="$2"
   local secret v4 v6 client_id peer_key endpoint reserved
   secret="$(jq -r '.private_key // empty' <<<"$data_json")"
   v4="$(jq -r '.config.interface.addresses.v4 // empty' <<<"$config_json")"
@@ -474,76 +524,59 @@ build_warp_outbound() {
   [[ -n "$endpoint" ]] || die "WARP config missing peer endpoint"
   [[ -n "$v4" || -n "$v6" ]] || die "WARP config missing interface addresses"
 
-  jq -cn \
-    --arg secret "$secret" \
-    --arg v4 "$v4" \
-    --arg v6 "$v6" \
-    --arg peer "$peer_key" \
-    --arg endpoint "$endpoint" \
-    --argjson reserved "$reserved" '
-      {
-        tag: "warp",
-        protocol: "wireguard",
-        settings: {
-          mtu: 1420,
-          secretKey: $secret,
-          address: ([
-            (if $v4 != "" then ($v4 + "/32") else empty end),
-            (if $v6 != "" then ($v6 + "/128") else empty end)
-          ]),
-          reserved: $reserved,
-          domainStrategy: "ForceIPv4v6",
-          peers: [{ publicKey: $peer, endpoint: $endpoint }],
-          noKernelTun: true
-        }
+  jq -cn --arg secret "$secret" --arg v4 "$v4" --arg v6 "$v6" --arg peer "$peer_key" --arg endpoint "$endpoint" --argjson reserved "$reserved" '
+    {
+      tag:"warp", protocol:"wireguard",
+      settings:{
+        mtu:1420,
+        secretKey:$secret,
+        address:[(if $v4!="" then ($v4+"/32") else empty end),(if $v6!="" then ($v6+"/128") else empty end)],
+        reserved:$reserved,
+        domainStrategy:"ForceIPv4v6",
+        peers:[{publicKey:$peer,endpoint:$endpoint}],
+        noKernelTun:true
       }
-    '
+    }'
 }
 
 ensure_warp_account_and_outbound() {
-  local cfg_file="$1"
-  local data reg config outbound
-
+  local cfg_file="$1" data reg config outbound
   if data="$(warp_account_data)"; then
     log "Existing 3x-ui WARP account found"
     config="$(api_post_obj_json "/xray/warp/config")" || die "Cannot fetch WARP config from 3x-ui"
   else
     local rc=$?
     (( rc == 2 )) || die "Cannot query existing WARP account"
-    need_cmd wg
-    log "No WARP account found; registering through 3x-ui"
-    local priv pub
-    priv="$(wg genkey)"
-    pub="$(printf '%s' "$priv" | wg pubkey)"
+    log "No WARP account found; preparing first-time registration"
+    local keypair priv pub
+    keypair="$(generate_wireguard_keypair)" || die "WARP registration key generation failed"
+    priv="$(jq -r '.privateKey' <<<"$keypair")"
+    pub="$(jq -r '.publicKey' <<<"$keypair")"
     reg="$(api_post_obj_json "/xray/warp/reg" "privateKey=$priv" "publicKey=$pub")" || die "3x-ui WARP registration failed"
     data="$(jq -ce '.data' <<<"$reg")"
     config="$(jq -ce '.config' <<<"$reg")"
-    unset priv pub
+    unset keypair priv pub
   fi
 
   outbound="$(build_warp_outbound "$data" "$config")"
   local tmp
   tmp="$(new_tmp)"
   jq --argjson warp "$outbound" '
-    .outbounds = (.outbounds // [])
-    | if any(.outbounds[]?; .tag == "warp")
-      then .outbounds |= map(if .tag == "warp" then (. * $warp) else . end)
+    .outbounds=(.outbounds//[])
+    | if any(.outbounds[]?; .tag=="warp")
+      then .outbounds |= map(if .tag=="warp" then (. * $warp) else . end)
       else .outbounds += [$warp]
-      end
-  ' "$cfg_file" >"$tmp"
+      end' "$cfg_file" >"$tmp"
   mv "$tmp" "$cfg_file"
 }
 
 geosite_tokens_ok() {
-  local csv="$1"
-  local issues
+  local csv="$1" issues
   issues="$(api_post_obj_json "/xray/geodata/validate" "kind=false" "tokens=$csv")" || return 1
   jq -e 'type == "array" and length == 0' >/dev/null <<<"$issues"
 }
 
-json_array_from_lines() {
-  jq -Rsc 'split("\n") | map(select(length > 0))'
-}
+json_array_from_lines() { jq -Rsc 'split("\n") | map(select(length > 0))'; }
 
 youtube_tokens() {
   cat <<'TOKENS'
@@ -592,408 +625,193 @@ custom_tokens() {
 }
 
 build_managed_rules() {
-  local direct_tag="$1"
-  local warp_lines=""
-  local direct_lines=""
-
+  local direct_tag="$1" warp_lines="" direct_lines=""
   case "$PROFILE" in
     gemini)
       warp_lines="$(gemini_tokens)"
-      if [[ "$YOUTUBE_MODE" == "direct" ]]; then
-        direct_lines="$(youtube_tokens)"
-      else
-        warp_lines+=$'\n'"$(youtube_tokens)"
-      fi
+      if [[ "$YOUTUBE_MODE" == "direct" ]]; then direct_lines="$(youtube_tokens)"; else warp_lines+=$'\n'"$(youtube_tokens)"; fi
       ;;
     google-web)
       if geosite_tokens_ok 'geosite:google,geosite:youtube'; then
         warp_lines='geosite:google'
-        if [[ "$YOUTUBE_MODE" == "direct" ]]; then
-          direct_lines='geosite:youtube'
-        else
-          warp_lines+=$'\n''geosite:youtube'
-        fi
+        if [[ "$YOUTUBE_MODE" == "direct" ]]; then direct_lines='geosite:youtube'; else warp_lines+=$'\n''geosite:youtube'; fi
       else
         warn "geosite:google/youtube unavailable or invalid; using explicit fallback domains"
         warp_lines="$(fallback_google_tokens)"
-        if [[ "$YOUTUBE_MODE" == "direct" ]]; then
-          direct_lines="$(youtube_tokens)"
-        else
-          warp_lines+=$'\n'"$(youtube_tokens)"
-        fi
+        if [[ "$YOUTUBE_MODE" == "direct" ]]; then direct_lines="$(youtube_tokens)"; else warp_lines+=$'\n'"$(youtube_tokens)"; fi
       fi
       ;;
     google-all)
-      if geosite_tokens_ok 'geosite:google'; then
-        warp_lines='geosite:google'
-      else
-        warn "geosite:google unavailable or invalid; using explicit fallback domains"
-        warp_lines="$(fallback_google_tokens)"
-      fi
+      if geosite_tokens_ok 'geosite:google'; then warp_lines='geosite:google'; else warn "geosite:google unavailable or invalid; using explicit fallback domains"; warp_lines="$(fallback_google_tokens)"; fi
       warp_lines+=$'\n'"$(youtube_tokens)"
       ;;
     custom)
       warp_lines="$(custom_tokens)"
-      if [[ "$YOUTUBE_MODE" == "direct" ]]; then
-        direct_lines="$(youtube_tokens)"
-      else
-        warp_lines+=$'\n'"$(youtube_tokens)"
-      fi
-      ;;
-    *)
-      die "Unknown profile: $PROFILE"
+      if [[ "$YOUTUBE_MODE" == "direct" ]]; then direct_lines="$(youtube_tokens)"; else warp_lines+=$'\n'"$(youtube_tokens)"; fi
       ;;
   esac
 
   local warp_json direct_json
   warp_json="$(printf '%s\n%s\n' "$MARKER_WARP" "$warp_lines" | awk 'NF && !seen[$0]++' | json_array_from_lines)"
   direct_json='[]'
-  if [[ -n "$direct_lines" ]]; then
-    direct_json="$(printf '%s\n%s\n' "$MARKER_DIRECT" "$direct_lines" | awk 'NF && !seen[$0]++' | json_array_from_lines)"
-  fi
-
-  jq -cn \
-    --arg warpTag "warp" \
-    --arg directTag "$direct_tag" \
-    --argjson warpDomains "$warp_json" \
-    --argjson directDomains "$direct_json" '
-      ([
-        (if ($directDomains|length) > 0 then
-          {type:"field", domain:$directDomains, outboundTag:$directTag}
-        else empty end),
-        {type:"field", domain:$warpDomains, outboundTag:$warpTag}
-      ])
-    '
+  [[ -z "$direct_lines" ]] || direct_json="$(printf '%s\n%s\n' "$MARKER_DIRECT" "$direct_lines" | awk 'NF && !seen[$0]++' | json_array_from_lines)"
+  jq -cn --arg warpTag "warp" --arg directTag "$direct_tag" --argjson warpDomains "$warp_json" --argjson directDomains "$direct_json" '
+    [(if ($directDomains|length)>0 then {type:"field",domain:$directDomains,outboundTag:$directTag} else empty end),{type:"field",domain:$warpDomains,outboundTag:$warpTag}]'
 }
 
 merge_managed_rules() {
-  local cfg_file="$1"
-  local managed_rules="$2"
-  local tmp
+  local cfg_file="$1" managed_rules="$2" tmp
   tmp="$(new_tmp)"
-
-  jq \
-    --arg markerWarp "$MARKER_WARP" \
-    --arg markerDirect "$MARKER_DIRECT" \
-    --arg priority "$PRIORITY" \
-    --argjson managed "$managed_rules" '
-      .routing = (.routing // {})
-      | .routing.rules = (.routing.rules // [])
-      | .routing.rules = (
-          .routing.rules
-          | map(select(
-              ((.domain // []) | index($markerWarp)) == null
-              and ((.domain // []) | index($markerDirect)) == null
-            ))
-        )
-      | if $priority == "prepend"
-        then .routing.rules = ($managed + .routing.rules)
-        else .routing.rules = (.routing.rules + $managed)
-        end
-    ' "$cfg_file" >"$tmp"
+  jq --arg markerWarp "$MARKER_WARP" --arg markerDirect "$MARKER_DIRECT" --arg priority "$PRIORITY" --argjson managed "$managed_rules" '
+    .routing=(.routing//{}) | .routing.rules=(.routing.rules//[])
+    | .routing.rules |= map(select(((.domain//[])|index($markerWarp))==null and ((.domain//[])|index($markerDirect))==null))
+    | if $priority=="prepend" then .routing.rules=($managed+.routing.rules) else .routing.rules=(.routing.rules+$managed) end' "$cfg_file" >"$tmp"
   mv "$tmp" "$cfg_file"
 }
 
 remove_managed_rules_from_file() {
-  local cfg_file="$1"
-  local tmp
+  local cfg_file="$1" tmp
   tmp="$(new_tmp)"
   jq --arg markerWarp "$MARKER_WARP" --arg markerDirect "$MARKER_DIRECT" '
-    if (.routing.rules? | type) == "array" then
-      .routing.rules |= map(select(
-        ((.domain // []) | index($markerWarp)) == null
-        and ((.domain // []) | index($markerDirect)) == null
-      ))
-    else . end
-  ' "$cfg_file" >"$tmp"
+    if (.routing.rules?|type)=="array" then .routing.rules |= map(select(((.domain//[])|index($markerWarp))==null and ((.domain//[])|index($markerDirect))==null)) else . end' "$cfg_file" >"$tmp"
   mv "$tmp" "$cfg_file"
 }
 
 managed_state_summary() {
   local cfg_file="$1"
-  jq -r --arg markerWarp "$MARKER_WARP" --arg markerDirect "$MARKER_DIRECT" '
-    def managed($m): [.routing.rules[]? | select(((.domain // []) | index($m)) != null)];
-    "warp_outbound=" + (if any(.outbounds[]?; .tag=="warp" and .protocol=="wireguard") then "present" else "missing" end),
-    "warp_rule_count=" + ((managed($markerWarp)|length)|tostring),
-    "direct_rule_count=" + ((managed($markerDirect)|length)|tostring),
-    "warp_endpoint=" + ([.outbounds[]? | select(.tag=="warp") | .settings.peers[0].endpoint][0] // "n/a"),
-    "warp_noKernelTun=" + (([.outbounds[]? | select(.tag=="warp") | .settings.noKernelTun][0] // false)|tostring)
-  ' "$cfg_file"
+  jq -r --arg mw "$MARKER_WARP" --arg md "$MARKER_DIRECT" '
+    def managed($m): [.routing.rules[]? | select(((.domain//[])|index($m))!=null)];
+    "warp_outbound="+(if any(.outbounds[]?;.tag=="warp" and .protocol=="wireguard") then "present" else "missing" end),
+    "warp_rule_count="+((managed($mw)|length)|tostring),
+    "direct_rule_count="+((managed($md)|length)|tostring),
+    "warp_endpoint="+([.outbounds[]?|select(.tag=="warp")|.settings.peers[0].endpoint][0]//"n/a"),
+    "warp_noKernelTun="+(([.outbounds[]?|select(.tag=="warp")|.settings.noKernelTun][0]//false)|tostring)' "$cfg_file"
+}
+
+route_decision_json() {
+  local domain="$1"
+  api_post_obj_json "/xray/routeTest" "domain=$domain" "port=443" "network=tcp"
 }
 
 route_test() {
-  local domain="$1" expected="$2"
-  local result
-  result="$(api_post_obj_json "/xray/routeTest" "domain=$domain" "port=443" "network=tcp")" || return 1
-  local matched tag
+  local domain="$1" expected="$2" result matched tag
+  result="$(route_decision_json "$domain")" || return 1
   matched="$(jq -r '.matched // false' <<<"$result")"
   tag="$(jq -r '.outboundTag // empty' <<<"$result")"
   printf '%-28s -> %s%s\n' "$domain" "${tag:-<default>}" "${expected:+ (expected: $expected)}"
   [[ "$matched" == "true" && "$tag" == "$expected" ]]
 }
 
-route_test_default_or_direct() {
-  local domain="$1" direct_tag="$2"
-  local result
-  result="$(api_post_obj_json "/xray/routeTest" "domain=$domain" "port=443" "network=tcp")" || return 1
-  local matched tag
-  matched="$(jq -r '.matched // false' <<<"$result")"
-  tag="$(jq -r '.outboundTag // empty' <<<"$result")"
-  printf '%-28s -> %s (expected direct/default)\n' "$domain" "${tag:-<default>}"
-  [[ "$matched" != "true" || "$tag" == "$direct_tag" ]]
+outbound_probe_json() {
+  local cfg_file="$1" warp all
+  warp="$(jq -c '.outbounds[]? | select(.tag=="warp")' "$cfg_file" | head -n 1)"
+  [[ -n "$warp" ]] || return 1
+  all="$(jq -c '.outbounds//[]' "$cfg_file")"
+  api_post_obj_json "/xray/testOutbound" "outbound=$warp" "allOutbounds=$all" "mode=real"
 }
 
 outbound_test() {
-  local cfg_file="$1"
-  local warp all result
-  warp="$(jq -c '.outbounds[] | select(.tag == "warp")' "$cfg_file" | head -n 1)"
-  [[ -n "$warp" ]] || return 1
-  all="$(jq -c '.outbounds // []' "$cfg_file")"
-  result="$(api_post_obj_json "/xray/testOutbound" "outbound=$warp" "allOutbounds=$all" "mode=real")" || return 1
+  local cfg_file="$1" result egress_country egress_warp
+  result="$(outbound_probe_json "$cfg_file")" || return 1
   printf 'WARP outbound test: %s\n' "$(jq -c . <<<"$result")"
-
-  # Current 3x-ui TestOutboundResult has an explicit success flag.
-  # Older/alternate shapes without that flag are accepted only when they do not
-  # carry an explicit error, preserving backward compatibility.
-  if ! jq -e '
-      if type != "object" then false
-      elif has("success") then .success == true
-      else ((.error? // "") == "") end
-    ' >/dev/null <<<"$result"; then
-    return 1
-  fi
-
-  local egress_country egress_warp
+  if ! jq -e 'if type!="object" then false elif has("success") then .success==true else ((.error? // "")=="") end' >/dev/null <<<"$result"; then return 1; fi
   egress_country="$(jq -r '.egress.country // empty' <<<"$result")"
   egress_warp="$(jq -r '.egress.warp // empty' <<<"$result")"
-  if [[ "$egress_warp" == "off" ]]; then
-    warn "Outbound probe reached the Internet but Cloudflare trace reports warp=off"
-    return 1
-  fi
-  if [[ "$egress_country" == "CN" ]]; then
-    warn "WARP egress country is CN; this does not satisfy the anti-misclassification goal"
-    return 1
-  fi
-  return 0
+  [[ "$egress_warp" != "off" ]] || { warn "Outbound probe reached the Internet but Cloudflare trace reports warp=off"; return 1; }
+  [[ "$egress_country" != "CN" ]] || { warn "WARP egress country is CN; this does not satisfy the anti-misclassification goal"; return 1; }
 }
 
 wait_for_route_api() {
   local i
   for i in {1..15}; do
-    if api_post_obj_json "/xray/routeTest" "domain=gemini.google.com" "port=443" "network=tcp" >/dev/null 2>&1; then
-      return 0
-    fi
+    if route_decision_json 'gemini.google.com' >/dev/null 2>&1; then return 0; fi
     sleep 1
   done
   return 1
 }
 
 post_apply_test() {
-  local cfg_file="$1" direct_tag="$2"
+  local cfg_file="$1" direct_tag="$2" ok=0
   wait_for_route_api || { warn "Xray route API did not become ready"; return 1; }
-
-  local ok=0
   case "$PROFILE" in
-    gemini)
-      route_test 'gemini.google.com' 'warp' || ok=1
-      ;;
-    google-web)
-      route_test 'www.google.com' 'warp' || ok=1
-      ;;
-    google-all)
-      route_test 'www.google.com' 'warp' || ok=1
-      route_test 'www.youtube.com' 'warp' || ok=1
-      ;;
-    custom)
-      # Custom tokens may be regex/geosite rules for which we cannot infer one
-      # representative hostname reliably. Structural validation is still done
-      # by 3x-ui on save, and the outbound test below exercises WARP itself.
-      ;;
+    gemini) route_test 'gemini.google.com' 'warp' || ok=1 ;;
+    google-web) route_test 'www.google.com' 'warp' || ok=1 ;;
+    google-all) route_test 'www.google.com' 'warp' || ok=1; route_test 'www.youtube.com' 'warp' || ok=1 ;;
+    custom) ;;
   esac
-
   if [[ "$YOUTUBE_MODE" == "direct" && "$PROFILE" != "google-all" ]]; then
-    route_test_default_or_direct 'www.youtube.com' "$direct_tag" || ok=1
+    local result tag
+    result="$(route_decision_json 'www.youtube.com')" || ok=1
+    tag="$(jq -r '.outboundTag // empty' <<<"${result:-{}}")"
+    printf '%-28s -> %s (expected direct/default)\n' 'www.youtube.com' "${tag:-<default>}"
+    [[ -z "$tag" || "$tag" == "$direct_tag" ]] || ok=1
   elif [[ "$YOUTUBE_MODE" == "warp" && "$PROFILE" != "google-all" ]]; then
     route_test 'www.youtube.com' 'warp' || ok=1
   fi
-
   outbound_test "$cfg_file" || ok=1
   return "$ok"
 }
 
 apply_routes() {
-  local allow_bootstrap="$1"
-  local payload cfg_file backup_file test_url direct_tag managed
-
+  local allow_bootstrap="$1" payload cfg_file backup_file test_url direct_tag managed
   payload="$(fetch_xray_payload)" || die "Cannot read Xray settings. Check API URL/token."
   cfg_file="$(new_tmp)"
-  jq '.xraySetting | if type == "string" then fromjson else . end' <<<"$payload" >"$cfg_file"
+  jq '.xraySetting | if type=="string" then fromjson else . end' <<<"$payload" >"$cfg_file"
   test_url="$(jq -r '.outboundTestUrl // "https://www.google.com/generate_204"' <<<"$payload")"
-
   backup_file="$(backup_payload "$payload")"
   log "Backup: $backup_file"
 
   if ! has_warp_outbound "$cfg_file"; then
-    if [[ "$allow_bootstrap" == "yes" ]]; then
-      ensure_warp_account_and_outbound "$cfg_file"
-    else
-      rm -f "$cfg_file"
-      die "No native 3x-ui WARP WireGuard outbound tagged 'warp'. Run '$SCRIPT_NAME bootstrap' or '$SCRIPT_NAME install'."
-    fi
+    if [[ "$allow_bootstrap" == "yes" ]]; then ensure_warp_account_and_outbound "$cfg_file"; else die "No native 3x-ui WARP WireGuard outbound tagged 'warp'. Run '$SCRIPT_NAME bootstrap' or '$SCRIPT_NAME install'."; fi
   fi
 
   direct_tag="$(find_direct_tag "$cfg_file")"
   managed="$(build_managed_rules "$direct_tag")"
   merge_managed_rules "$cfg_file" "$managed"
   jq -e . "$cfg_file" >/dev/null || die "Generated config is not valid JSON"
-
   log "Applying profile=$PROFILE youtube=$YOUTUBE_MODE priority=$PRIORITY directTag=$direct_tag"
   if ! save_config_file "$cfg_file" "$test_url"; then
     warn "3x-ui rejected the config or failed to reload Xray"
-    if (( AUTO_ROLLBACK )); then
-      restore_backup_file "$backup_file"
-    fi
-    rm -f "$cfg_file"
+    (( AUTO_ROLLBACK )) && restore_backup_file "$backup_file"
     return 1
   fi
 
-  # Refresh from panel after save because 3x-ui may hoist API/DNS routing rules.
   local refreshed refreshed_cfg
   refreshed="$(fetch_xray_payload)" || true
   refreshed_cfg="$(new_tmp)"
-  if [[ -n "$refreshed" ]]; then
-    jq '.xraySetting | if type == "string" then fromjson else . end' <<<"$refreshed" >"$refreshed_cfg"
-  else
-    cp "$cfg_file" "$refreshed_cfg"
-  fi
-
+  if [[ -n "$refreshed" ]]; then jq '.xraySetting | if type=="string" then fromjson else . end' <<<"$refreshed" >"$refreshed_cfg"; else cp "$cfg_file" "$refreshed_cfg"; fi
   if ! post_apply_test "$refreshed_cfg" "$direct_tag"; then
     warn "Post-apply verification failed"
-    if (( AUTO_ROLLBACK )); then
-      restore_backup_file "$backup_file"
-      rm -f "$cfg_file" "$refreshed_cfg"
-      return 1
-    fi
+    if (( AUTO_ROLLBACK )); then restore_backup_file "$backup_file"; return 1; fi
   fi
-
   log "Applied successfully"
-  rm -f "$cfg_file" "$refreshed_cfg"
 }
 
 bootstrap_only() {
   local payload cfg_file backup_file test_url
   payload="$(fetch_xray_payload)" || die "Cannot read Xray settings"
   cfg_file="$(new_tmp)"
-  jq '.xraySetting | if type == "string" then fromjson else . end' <<<"$payload" >"$cfg_file"
+  jq '.xraySetting | if type=="string" then fromjson else . end' <<<"$payload" >"$cfg_file"
   test_url="$(jq -r '.outboundTestUrl // "https://www.google.com/generate_204"' <<<"$payload")"
   backup_file="$(backup_payload "$payload")"
   log "Backup: $backup_file"
-
   ensure_warp_account_and_outbound "$cfg_file"
-  save_config_file "$cfg_file" "$test_url" || {
-    warn "Failed to save WARP outbound"
-    (( AUTO_ROLLBACK )) && restore_backup_file "$backup_file"
-    rm -f "$cfg_file"
-    return 1
-  }
-  if ! outbound_test "$cfg_file"; then
-    warn "WARP outbound was created but connectivity test failed"
-    if (( AUTO_ROLLBACK )); then
-      restore_backup_file "$backup_file"
-      rm -f "$cfg_file"
-      return 1
-    fi
-  fi
+  save_config_file "$cfg_file" "$test_url" || { warn "Failed to save WARP outbound"; (( AUTO_ROLLBACK )) && restore_backup_file "$backup_file"; return 1; }
+  outbound_test "$cfg_file" || { warn "WARP outbound was created but connectivity test failed"; (( AUTO_ROLLBACK )) && restore_backup_file "$backup_file"; return 1; }
   log "Native 3x-ui WARP outbound is ready"
-  rm -f "$cfg_file"
 }
 
 remove_routes() {
   local payload cfg_file backup_file test_url
   payload="$(fetch_xray_payload)" || die "Cannot read Xray settings"
   cfg_file="$(new_tmp)"
-  jq '.xraySetting | if type == "string" then fromjson else . end' <<<"$payload" >"$cfg_file"
+  jq '.xraySetting | if type=="string" then fromjson else . end' <<<"$payload" >"$cfg_file"
   test_url="$(jq -r '.outboundTestUrl // "https://www.google.com/generate_204"' <<<"$payload")"
   backup_file="$(backup_payload "$payload")"
   log "Backup: $backup_file"
   remove_managed_rules_from_file "$cfg_file"
-  save_config_file "$cfg_file" "$test_url" || {
-    warn "Failed to remove managed rules"
-    (( AUTO_ROLLBACK )) && restore_backup_file "$backup_file"
-    rm -f "$cfg_file"
-    return 1
-  }
+  save_config_file "$cfg_file" "$test_url" || { warn "Failed to remove managed rules"; (( AUTO_ROLLBACK )) && restore_backup_file "$backup_file"; return 1; }
   log "Managed routing rules removed; WARP account/outbound left untouched"
-  rm -f "$cfg_file"
-}
-
-show_status() {
-  local payload cfg_file
-  payload="$(fetch_xray_payload)" || die "Cannot read Xray settings"
-  cfg_file="$(new_tmp)"
-  jq '.xraySetting | if type == "string" then fromjson else . end' <<<"$payload" >"$cfg_file"
-  managed_state_summary "$cfg_file"
-  printf '\nManaged rules:\n'
-  jq -r --arg mw "$MARKER_WARP" --arg md "$MARKER_DIRECT" '
-    .routing.rules[]?
-    | select(((.domain // []) | index($mw)) != null or ((.domain // []) | index($md)) != null)
-    | "- " + .outboundTag + ": " + ((.domain // []) | join(", "))
-  ' "$cfg_file"
-  printf '\n3x-ui WARP rotation:\n'
-  show_rotate_interval
-  rm -f "$cfg_file"
-}
-
-test_current() {
-  local payload cfg_file direct_tag warp_domains direct_domains ok=0 representative=""
-  payload="$(fetch_xray_payload)" || die "Cannot read Xray settings"
-  cfg_file="$(new_tmp)"
-  jq '.xraySetting | if type == "string" then fromjson else . end' <<<"$payload" >"$cfg_file"
-  has_warp_outbound "$cfg_file" || die "WARP outbound missing"
-  direct_tag="$(find_direct_tag "$cfg_file")"
-
-  warp_domains="$(jq -c --arg m "$MARKER_WARP" '[.routing.rules[]? | select(((.domain // []) | index($m)) != null) | .domain[]? | select(. != $m)]' "$cfg_file")"
-  direct_domains="$(jq -c --arg m "$MARKER_DIRECT" '[.routing.rules[]? | select(((.domain // []) | index($m)) != null) | .domain[]? | select(. != $m)]' "$cfg_file")"
-
-  if jq -e 'any(.[]; . == "geosite:google" or . == "domain:google.com" or . == "full:www.google.com")' >/dev/null <<<"$warp_domains"; then
-    route_test 'www.google.com' 'warp' || ok=1
-  elif jq -e 'any(.[]; . == "domain:gemini.google.com" or . == "full:gemini.google.com")' >/dev/null <<<"$warp_domains"; then
-    route_test 'gemini.google.com' 'warp' || ok=1
-  else
-    representative="$(jq -r '[.[] | select(startswith("full:") or startswith("domain:")) | select(test("youtube|youtu\\.be|googlevideo|ytimg|yt\\.be") | not)][0] // empty' <<<"$warp_domains")"
-    if [[ -n "$representative" ]]; then
-      representative="${representative#full:}"
-      representative="${representative#domain:}"
-      route_test "$representative" 'warp' || ok=1
-    elif [[ "$(jq 'length' <<<"$warp_domains")" -gt 0 ]]; then
-      log "No deterministic representative domain for the managed WARP rule; skipping strict domain route assertion"
-    else
-      warn "No managed WARP routing rule found"
-      ok=1
-    fi
-  fi
-
-  if jq -e 'any(.[]; . == "geosite:youtube" or test("youtube|youtu\\.be|googlevideo|ytimg|yt\\.be"))' >/dev/null <<<"$direct_domains"; then
-    route_test 'www.youtube.com' "$direct_tag" || ok=1
-  elif jq -e 'any(.[]; . == "geosite:youtube" or test("youtube|youtu\\.be|googlevideo|ytimg|yt\\.be"))' >/dev/null <<<"$warp_domains"; then
-    route_test 'www.youtube.com' 'warp' || ok=1
-  fi
-
-  outbound_test "$cfg_file" || ok=1
-  rm -f "$cfg_file"
-  (( ok == 0 )) || die "One or more tests failed"
-  log "Tests passed"
-}
-
-rotate_warp() {
-  local result
-  result="$(api_post_obj_json "/xray/warp/changeIp")" || die "WARP IP rotation failed"
-  local warning
-  warning="$(jq -r '.warning // empty' <<<"$result")"
-  [[ -z "$warning" ]] || warn "$warning"
-  log "3x-ui rotated the WARP registration/IP and updated the warp outbound"
-  sleep 1
-  test_current
 }
 
 get_rotate_interval() {
@@ -1005,11 +823,7 @@ get_rotate_interval() {
 show_rotate_interval() {
   local days
   if days="$(get_rotate_interval)"; then
-    if [[ "$days" =~ ^[0-9]+$ ]] && (( days > 0 )); then
-      printf 'warp_auto_rotation_days=%s\n' "$days"
-    else
-      printf 'warp_auto_rotation_days=0 (disabled)\n'
-    fi
+    if [[ "$days" =~ ^[0-9]+$ ]] && (( days > 0 )); then printf 'warp_auto_rotation_days=%s\n' "$days"; else printf 'warp_auto_rotation_days=0 (disabled)\n'; fi
   else
     printf 'warp_auto_rotation_days=unknown\n'
   fi
@@ -1019,18 +833,216 @@ set_rotate_interval() {
   local days="$1"
   [[ "$days" =~ ^[0-9]+$ ]] || die "--rotate-days must be a non-negative integer"
   api_post_obj_json "/xray/warp/interval" "interval=$days" >/dev/null || die "Failed to set WARP rotation interval"
-  if (( days == 0 )); then
-    log "WARP auto-rotation disabled"
-  else
-    log "WARP auto-rotation interval set to ${days} day(s)"
+  if (( days == 0 )); then log "WARP auto-rotation disabled"; else log "WARP auto-rotation interval set to ${days} day(s)"; fi
+}
+
+show_status() {
+  local payload cfg_file
+  payload="$(fetch_xray_payload)" || die "Cannot read Xray settings"
+  cfg_file="$(new_tmp)"
+  jq '.xraySetting | if type=="string" then fromjson else . end' <<<"$payload" >"$cfg_file"
+  managed_state_summary "$cfg_file"
+  printf '\nManaged rules:\n'
+  jq -r --arg mw "$MARKER_WARP" --arg md "$MARKER_DIRECT" '.routing.rules[]? | select(((.domain//[])|index($mw))!=null or ((.domain//[])|index($md))!=null) | "- "+.outboundTag+": "+((.domain//[])|join(", "))' "$cfg_file"
+  printf '\n3x-ui WARP rotation:\n'
+  show_rotate_interval
+}
+
+managed_domains_json() {
+  local cfg_file="$1" marker="$2"
+  jq -c --arg m "$marker" '[.routing.rules[]? | select(((.domain//[])|index($m))!=null) | .domain[]? | select(.!=$m)]' "$cfg_file"
+}
+
+domain_expected_warp() {
+  local cfg_file="$1" kind="$2" domains
+  domains="$(managed_domains_json "$cfg_file" "$MARKER_WARP")"
+  case "$kind" in
+    google)
+      jq -e 'any(.[]; .=="geosite:google" or .=="domain:google.com" or .=="full:www.google.com")' >/dev/null <<<"$domains"
+      ;;
+    gemini)
+      jq -e 'any(.[]; .=="geosite:google" or .=="domain:google.com" or .=="domain:gemini.google.com" or .=="full:gemini.google.com")' >/dev/null <<<"$domains"
+      ;;
+    youtube)
+      jq -e 'any(.[]; .=="geosite:youtube" or test("youtube|youtu\\.be|googlevideo|ytimg|yt\\.be"))' >/dev/null <<<"$domains"
+      ;;
+  esac
+}
+
+domain_expected_direct() {
+  local cfg_file="$1" kind="$2" domains
+  domains="$(managed_domains_json "$cfg_file" "$MARKER_DIRECT")"
+  case "$kind" in
+    youtube) jq -e 'any(.[]; .=="geosite:youtube" or test("youtube|youtu\\.be|googlevideo|ytimg|yt\\.be"))' >/dev/null <<<"$domains" ;;
+    *) return 1 ;;
+  esac
+}
+
+test_current() {
+  local payload cfg_file direct_tag ok=0 result tag
+  payload="$(fetch_xray_payload)" || die "Cannot read Xray settings"
+  cfg_file="$(new_tmp)"
+  jq '.xraySetting | if type=="string" then fromjson else . end' <<<"$payload" >"$cfg_file"
+  has_warp_outbound "$cfg_file" || die "WARP outbound missing"
+  direct_tag="$(find_direct_tag "$cfg_file")"
+
+  if domain_expected_warp "$cfg_file" google; then route_test 'www.google.com' 'warp' || ok=1; fi
+  if domain_expected_warp "$cfg_file" gemini; then route_test 'gemini.google.com' 'warp' || ok=1; fi
+  if domain_expected_warp "$cfg_file" youtube; then
+    route_test 'www.youtube.com' 'warp' || ok=1
+  elif domain_expected_direct "$cfg_file" youtube; then
+    result="$(route_decision_json 'www.youtube.com')" || ok=1
+    tag="$(jq -r '.outboundTag // empty' <<<"${result:-{}}")"
+    printf '%-28s -> %s (expected direct/default)\n' 'www.youtube.com' "${tag:-<default>}"
+    [[ -z "$tag" || "$tag" == "$direct_tag" ]] || ok=1
   fi
+  outbound_test "$cfg_file" || ok=1
+  (( ok == 0 )) || die "One or more tests failed"
+  log "Tests passed"
+}
+
+rotate_warp() {
+  local result warning
+  result="$(api_post_obj_json "/xray/warp/changeIp")" || die "WARP IP rotation failed"
+  warning="$(jq -r '.warning // empty' <<<"$result")"
+  [[ -z "$warning" ]] || warn "$warning"
+  log "3x-ui rotated the WARP registration/IP and updated the warp outbound"
+  sleep 1
+  test_current
 }
 
 manage_rotation() {
-  if [[ -n "$ROTATE_DAYS" ]]; then
-    set_rotate_interval "$ROTATE_DAYS"
-  fi
+  [[ -z "$ROTATE_DAYS" ]] || set_rotate_interval "$ROTATE_DAYS"
   show_rotate_interval
+}
+
+diag_line() {
+  local level="$1" label="$2" value="$3"
+  printf '[%-4s] %-24s %s\n' "$level" "$label" "$value"
+}
+
+diagnose_route() {
+  local cfg_file="$1" label="$2" domain="$3" expected="$4" direct_tag="${5:-}" result matched tag actual
+  if ! result="$(route_decision_json "$domain")"; then
+    diag_line FAIL "$label route" "routeTest API failed"
+    return 1
+  fi
+  matched="$(jq -r '.matched // false' <<<"$result")"
+  tag="$(jq -r '.outboundTag // empty' <<<"$result")"
+  actual="${tag:-<default>}"
+  if [[ -z "$expected" ]]; then
+    diag_line INFO "$label route" "$domain -> $actual"
+    return 0
+  fi
+  if [[ "$expected" == "direct" ]]; then
+    if [[ -z "$tag" || ( -n "$direct_tag" && "$tag" == "$direct_tag" ) ]]; then
+      diag_line OK "$label route" "$domain -> $actual (expected direct/default)"
+      return 0
+    fi
+  elif [[ "$matched" == "true" && "$tag" == "$expected" ]]; then
+    diag_line OK "$label route" "$domain -> $actual"
+    return 0
+  fi
+  diag_line FAIL "$label route" "$domain -> $actual (expected $expected)"
+  return 1
+}
+
+diagnose() {
+  local issues=0 warnings=0 payload cfg_file probe probe_ok=0 direct_tag="" days="" expected
+  printf '========================================\n'
+  printf '3xui-warp-router diagnosis v%s\n' "$VERSION"
+  printf '========================================\n\n'
+
+  if ! payload="$(fetch_xray_payload)"; then
+    diag_line FAIL "3x-ui API" "authentication/request failed"
+    printf '\nConclusion:\n  FAIL - Cannot read 3x-ui Xray settings. Check API base/token and panel reachability.\n'
+    return 1
+  fi
+  diag_line OK "3x-ui API" "reachable and authenticated"
+
+  cfg_file="$(new_tmp)"
+  if ! jq '.xraySetting | if type=="string" then fromjson else . end' <<<"$payload" >"$cfg_file" || ! jq -e . "$cfg_file" >/dev/null; then
+    diag_line FAIL "Xray config" "invalid or unreadable JSON"
+    printf '\nConclusion:\n  FAIL - 3x-ui returned an invalid Xray configuration.\n'
+    return 1
+  fi
+  diag_line OK "Xray config" "valid JSON"
+
+  if route_decision_json 'www.google.com' >/dev/null 2>&1; then diag_line OK "Xray route API" "responsive"; else diag_line FAIL "Xray route API" "not responsive"; issues=$((issues+1)); fi
+
+  if has_warp_outbound "$cfg_file"; then
+    diag_line OK "WARP outbound" "present (wireguard)"
+    local endpoint no_kernel
+    endpoint="$(jq -r '[.outbounds[]?|select(.tag=="warp")|.settings.peers[0].endpoint][0] // "n/a"' "$cfg_file")"
+    no_kernel="$(jq -r '[.outbounds[]?|select(.tag=="warp")|.settings.noKernelTun][0] // false' "$cfg_file")"
+    diag_line INFO "WARP endpoint" "$endpoint"
+    if [[ "$no_kernel" == "true" ]]; then diag_line OK "WARP userspace" "noKernelTun=true"; else diag_line WARN "WARP userspace" "noKernelTun is not true"; warnings=$((warnings+1)); fi
+  else
+    diag_line FAIL "WARP outbound" "missing"
+    issues=$((issues+1))
+  fi
+
+  if has_warp_outbound "$cfg_file" && probe="$(outbound_probe_json "$cfg_file" 2>/dev/null)"; then
+    local success ipv4 ipv6 country warp_state delay error
+    success="$(jq -r 'if has("success") then .success else ((.error? // "")=="") end' <<<"$probe")"
+    ipv4="$(jq -r '.egress.ipv4 // .egress.ip // empty' <<<"$probe")"
+    ipv6="$(jq -r '.egress.ipv6 // empty' <<<"$probe")"
+    country="$(jq -r '.egress.country // empty' <<<"$probe")"
+    warp_state="$(jq -r '.egress.warp // empty' <<<"$probe")"
+    delay="$(jq -r '.delay // empty' <<<"$probe")"
+    error="$(jq -r '.error // empty' <<<"$probe")"
+    if [[ "$success" == "true" ]]; then diag_line OK "WARP connectivity" "success${delay:+, delay=${delay}}"; probe_ok=1; else diag_line FAIL "WARP connectivity" "${error:-probe failed}"; issues=$((issues+1)); fi
+    diag_line INFO "WARP egress IPv4" "${ipv4:-unknown}"
+    [[ -z "$ipv6" ]] || diag_line INFO "WARP egress IPv6" "$ipv6"
+    diag_line INFO "WARP egress country" "${country:-unknown}"
+    diag_line INFO "Cloudflare WARP" "${warp_state:-unknown}"
+    if [[ "$warp_state" == "off" ]]; then diag_line FAIL "WARP trace check" "warp=off"; issues=$((issues+1)); fi
+    if [[ "$country" == "CN" ]]; then diag_line FAIL "WARP country check" "country=CN"; issues=$((issues+1)); fi
+  elif has_warp_outbound "$cfg_file"; then
+    diag_line FAIL "WARP connectivity" "outbound probe API failed"
+    issues=$((issues+1))
+  fi
+
+  direct_tag="$(jq -r '[.outbounds[]?|select(.protocol=="freedom")|.tag][0] // empty' "$cfg_file")"
+  [[ -n "$direct_tag" ]] && diag_line OK "Direct outbound" "$direct_tag" || { diag_line WARN "Direct outbound" "freedom outbound not found"; warnings=$((warnings+1)); }
+
+  expected=""
+  domain_expected_warp "$cfg_file" google && expected="warp"
+  diagnose_route "$cfg_file" "Google" 'www.google.com' "$expected" || issues=$((issues+1))
+
+  expected=""
+  domain_expected_warp "$cfg_file" gemini && expected="warp"
+  diagnose_route "$cfg_file" "Gemini" 'gemini.google.com' "$expected" || issues=$((issues+1))
+
+  expected=""
+  if domain_expected_warp "$cfg_file" youtube; then expected="warp"; elif domain_expected_direct "$cfg_file" youtube; then expected="direct"; fi
+  diagnose_route "$cfg_file" "YouTube" 'www.youtube.com' "$expected" "$direct_tag" || issues=$((issues+1))
+
+  if days="$(get_rotate_interval)"; then
+    if [[ "$days" =~ ^[0-9]+$ ]] && (( days > 0 )); then diag_line INFO "WARP auto-rotation" "every ${days} day(s)"; else diag_line INFO "WARP auto-rotation" "disabled"; fi
+  else
+    diag_line WARN "WARP auto-rotation" "unable to read setting"
+    warnings=$((warnings+1))
+  fi
+
+  local managed_warp_count managed_direct_count
+  managed_warp_count="$(jq --arg m "$MARKER_WARP" '[.routing.rules[]?|select(((.domain//[])|index($m))!=null)]|length' "$cfg_file")"
+  managed_direct_count="$(jq --arg m "$MARKER_DIRECT" '[.routing.rules[]?|select(((.domain//[])|index($m))!=null)]|length' "$cfg_file")"
+  diag_line INFO "Managed rules" "warp=${managed_warp_count}, direct=${managed_direct_count}"
+  if (( managed_warp_count == 0 )); then diag_line WARN "Managed routing" "no xui-warp-router WARP rule found"; warnings=$((warnings+1)); fi
+
+  printf '\nConclusion:\n'
+  if (( issues > 0 )); then
+    printf '  FAIL - %d blocking issue(s), %d warning(s).\n' "$issues" "$warnings"
+    if (( probe_ok == 0 )); then printf '  Action: fix WARP outbound connectivity first, then run diagnose again.\n'; else printf '  Action: inspect the FAIL route/config lines above; WARP itself is reachable.\n'; fi
+    return 1
+  fi
+  if (( warnings > 0 )); then
+    printf '  OK with warnings - WARP/routing checks passed; review %d warning(s).\n' "$warnings"
+  else
+    printf '  OK - Xray, WARP, managed routing, and rotation checks are healthy.\n'
+  fi
+  printf '  Recommendation: keep the current WARP IP while Google/Gemini work normally.\n'
 }
 
 list_backups() {
@@ -1041,7 +1053,6 @@ list_backups() {
 parse_args() {
   (($# > 0)) || { usage; exit 2; }
   COMMAND="$1"; shift
-
   while (($#)); do
     case "$1" in
       --api-base) [[ $# -ge 2 ]] || die "--api-base requires a value"; API_BASE="$2"; shift 2 ;;
@@ -1062,15 +1073,11 @@ parse_args() {
       *) die "Unknown option: $1" ;;
     esac
   done
-
 }
 
 main() {
   (($# > 0)) || { usage; exit 2; }
-  case "$1" in
-    help|-h|--help) usage; return 0 ;;
-    --version) printf '%s\n' "$VERSION"; return 0 ;;
-  esac
+  case "$1" in help|-h|--help) usage; return 0 ;; --version) printf '%s\n' "$VERSION"; return 0 ;; esac
 
   preparse_config_args "$@"
   load_config_file
@@ -1097,28 +1104,16 @@ main() {
   init_run_tmpdir
 
   case "$COMMAND" in
-    install)
-      apply_routes yes
-      [[ -z "$ROTATE_DAYS" ]] || set_rotate_interval "$ROTATE_DAYS"
-      ;;
-    bootstrap)
-      bootstrap_only
-      [[ -z "$ROTATE_DAYS" ]] || set_rotate_interval "$ROTATE_DAYS"
-      ;;
-    apply)
-      apply_routes no
-      [[ -z "$ROTATE_DAYS" ]] || set_rotate_interval "$ROTATE_DAYS"
-      ;;
+    install) apply_routes yes; [[ -z "$ROTATE_DAYS" ]] || set_rotate_interval "$ROTATE_DAYS" ;;
+    bootstrap) bootstrap_only; [[ -z "$ROTATE_DAYS" ]] || set_rotate_interval "$ROTATE_DAYS" ;;
+    apply) apply_routes no; [[ -z "$ROTATE_DAYS" ]] || set_rotate_interval "$ROTATE_DAYS" ;;
     status) show_status ;;
     test) test_current ;;
+    diagnose) diagnose ;;
     rotate) rotate_warp ;;
     rotation) manage_rotation ;;
     remove) remove_routes ;;
-    rollback)
-      local b
-      b="$(latest_backup)" || die "No backups found in $STATE_DIR/backups"
-      restore_backup_file "$b"
-      ;;
+    rollback) local b; b="$(latest_backup)" || die "No backups found in $STATE_DIR/backups"; restore_backup_file "$b" ;;
     backups) list_backups ;;
     help) usage ;;
     *) die "Unknown command: $COMMAND" ;;
